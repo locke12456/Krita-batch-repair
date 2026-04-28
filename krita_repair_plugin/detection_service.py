@@ -27,6 +27,10 @@ class DetectionOptions:
     score_threshold: float = 0.0
     crop_strategy: str = "bbox"
     transparent_pixel_handling: str = "preserve"
+    force_rect_crop: bool = False
+    rect_width: int = 260
+    rect_height: int = 340
+    clamp_rect_to_source_bounds: bool = True
 
     def to_detector_options(self) -> dict[str, Any]:
         """Return options accepted by PluginDetector."""
@@ -40,6 +44,64 @@ class DetectionOptions:
         if self.filter_label:
             result["filter_label"] = self.filter_label
         return result
+
+
+def expand_bbox_to_forced_rect(
+    bbox: dict[str, int],
+    image_width: int,
+    image_height: int,
+    target_width: int,
+    target_height: int,
+    clamp_to_bounds: bool = True,
+) -> dict[str, int]:
+    """Expand a detector bbox around its center to a fixed crop rectangle."""
+    x = int(bbox.get("x", bbox.get("x1", 0)) or 0)
+    y = int(bbox.get("y", bbox.get("y1", 0)) or 0)
+    width = int(bbox.get("width", 0) or 0)
+    height = int(bbox.get("height", 0) or 0)
+    if width <= 0 and "x2" in bbox:
+        width = int(bbox["x2"]) - x
+    if height <= 0 and "y2" in bbox:
+        height = int(bbox["y2"]) - y
+
+    bbox_width = max(1, width)
+    bbox_height = max(1, height)
+    actual_width = max(int(target_width), bbox_width)
+    actual_height = max(int(target_height), bbox_height)
+    center_x = x + bbox_width // 2
+    center_y = y + bbox_height // 2
+
+    x1 = center_x - actual_width // 2
+    y1 = center_y - actual_height // 2
+    x2 = x1 + actual_width
+    y2 = y1 + actual_height
+
+    if clamp_to_bounds:
+        if x1 < 0:
+            x2 -= x1
+            x1 = 0
+        if y1 < 0:
+            y2 -= y1
+            y1 = 0
+        if x2 > image_width:
+            shift = x2 - int(image_width)
+            x1 -= shift
+            x2 = int(image_width)
+        if y2 > image_height:
+            shift = y2 - int(image_height)
+            y1 -= shift
+            y2 = int(image_height)
+        x1 = max(0, x1)
+        y1 = max(0, y1)
+        x2 = min(int(image_width), x2)
+        y2 = min(int(image_height), y2)
+
+    return {
+        "x": int(x1),
+        "y": int(y1),
+        "width": max(1, int(x2 - x1)),
+        "height": max(1, int(y2 - y1)),
+    }
 
 
 class DetectionService:
@@ -235,6 +297,10 @@ class DetectionService:
             transparent_pixel_handling=str(
                 data.get("transparent_pixel_handling", "preserve") or "preserve"
             ),
+            force_rect_crop=bool(data.get("force_rect_crop", False)),
+            rect_width=int(data.get("rect_width", 260) or 260),
+            rect_height=int(data.get("rect_height", 340) or 340),
+            clamp_rect_to_source_bounds=bool(data.get("clamp_rect_to_source_bounds", True)),
         )
 
     def _bbox_to_document_dict(

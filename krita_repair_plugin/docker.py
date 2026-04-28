@@ -12,11 +12,14 @@ from .group_selection_model import GroupSelectionModel, RepairGroupRow
 from .group_sync_source import GroupSyncSource
 from .layer_metadata_service import LayerMetadataService
 from .prompt_extraction_service import PromptExtractionService
+from .prompt_extraction_worker import PromptExtractionProgress, PromptExtractionWorker
+from .repair_result_model import RepairResultSelectionModel, RepairResultRow
 from .repair_compat import (
     QCheckBox,
     QComboBox,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QMessageBox,
     QPushButton,
     QScrollArea,
@@ -41,7 +44,9 @@ class RepairDocker(DockWidget):
 
         self.detector_manager = DetectorModelManager()
         self.group_selection_model = GroupSelectionModel()
+        self.result_selection_model = RepairResultSelectionModel()
         self.metadata_service = LayerMetadataService()
+        self.prompt_worker: PromptExtractionWorker | None = None
         self.prompt_extraction_service = PromptExtractionService(
             metadata_service=self.metadata_service,
         )
@@ -50,6 +55,7 @@ class RepairDocker(DockWidget):
             self.detector_manager,
             self.metadata_service,
             self.prompt_extraction_service,
+            self.result_selection_model,
         )
 
         self._status_label = QLabel("Detector: unloaded")
@@ -60,11 +66,25 @@ class RepairDocker(DockWidget):
         self._detect_button = QPushButton("Batch Detect Selected Groups")
         self._image2tagger_checkbox = QCheckBox("Use image2tagger prompt")
         self._generation_checkbox = QCheckBox("Generate bbox repair")
+        self._force_rect_checkbox = QCheckBox("Force rect crop")
+        self._rect_width_input = QLineEdit("260")
+        self._rect_height_input = QLineEdit("340")
+        self._clamp_rect_checkbox = QCheckBox("Clamp to source bounds")
+        self._clamp_rect_checkbox.setChecked(True)
+        self._extract_tags_button = QPushButton("Extract Tags for Selected Results")
+        self._cancel_tags_button = QPushButton("Cancel Tag Extraction")
+        self._select_all_results_button = QPushButton("Select All Results")
+        self._clear_results_button = QPushButton("Clear Results")
+        self._generate_results_button = QPushButton("Generate Selected Results")
+        self._prompt_progress_label = QLabel("Prompt extraction: 0 / 0")
         self._select_all_button = QPushButton("Select All Groups")
         self._clear_selected_button = QPushButton("Clear Groups")
         self._row_scroll = QScrollArea()
         self._row_container = QWidget()
         self._row_layout = QVBoxLayout()
+        self._result_scroll = QScrollArea()
+        self._result_container = QWidget()
+        self._result_layout = QVBoxLayout()
         self._report_label = QLabel("Batch Report: no run yet.")
 
         self._build_ui()
@@ -109,6 +129,15 @@ class RepairDocker(DockWidget):
         option_row.addWidget(self._generation_checkbox)
         layout.addLayout(option_row)
 
+        rect_row = QHBoxLayout()
+        rect_row.addWidget(self._force_rect_checkbox)
+        rect_row.addWidget(QLabel("Width"))
+        rect_row.addWidget(self._rect_width_input)
+        rect_row.addWidget(QLabel("Height"))
+        rect_row.addWidget(self._rect_height_input)
+        rect_row.addWidget(self._clamp_rect_checkbox)
+        layout.addLayout(rect_row)
+
         layout.addWidget(self._detect_button)
         layout.addWidget(self._status_label)
 
@@ -117,8 +146,28 @@ class RepairDocker(DockWidget):
         self._row_scroll.setWidgetResizable(True)
         layout.addWidget(QLabel("Group List"))
         layout.addWidget(self._row_scroll)
+
+        result_action_row = QHBoxLayout()
+        result_action_row.addWidget(self._select_all_results_button)
+        result_action_row.addWidget(self._clear_results_button)
+        layout.addLayout(result_action_row)
+
+        tag_row = QHBoxLayout()
+        tag_row.addWidget(self._extract_tags_button)
+        tag_row.addWidget(self._cancel_tags_button)
+        layout.addLayout(tag_row)
+        layout.addWidget(self._prompt_progress_label)
+
+        self._result_container.setLayout(self._result_layout)
+        self._result_scroll.setWidget(self._result_container)
+        self._result_scroll.setWidgetResizable(True)
+        layout.addWidget(QLabel("Detection Results"))
+        layout.addWidget(self._result_scroll)
+        layout.addWidget(self._generate_results_button)
+
         layout.addWidget(self._report_label)
         self._refresh_group_rows()
+        self._refresh_result_rows()
 
         if hasattr(self, "setWidget"):
             self.setWidget(root)
@@ -133,11 +182,25 @@ class RepairDocker(DockWidget):
         self._detect_button.clicked.connect(self._batch_detect_selected_groups)
         self._select_all_button.clicked.connect(self._select_all_groups)
         self._clear_selected_button.clicked.connect(self._clear_groups)
+        self._select_all_results_button.clicked.connect(self._select_all_results)
+        self._clear_results_button.clicked.connect(self._clear_results)
+        self._extract_tags_button.clicked.connect(self._extract_tags_for_selected_results)
+        self._cancel_tags_button.clicked.connect(self._cancel_tag_extraction)
+        self._generate_results_button.clicked.connect(self._generate_selected_results)
 
     def _current_mode(self) -> str:
         """Return the current detector mode filter."""
         text = self._mode_combo.currentText()
         return str(text or "all").strip().lower() or "all"
+
+    def _detection_options(self) -> DetectionOptions:
+        """Return detection options from the current UI controls."""
+        return DetectionOptions(
+            force_rect_crop=self._force_rect_checkbox.isChecked(),
+            rect_width=max(1, int(self._rect_width_input.text() or "260")),
+            rect_height=max(1, int(self._rect_height_input.text() or "340")),
+            clamp_rect_to_source_bounds=self._clamp_rect_checkbox.isChecked(),
+        )
 
     def _refresh_groups(self) -> None:
         """Load group-backed SyncRecord rows from the active document."""
@@ -179,11 +242,14 @@ class RepairDocker(DockWidget):
             reports = self.group_batch_detection_service.detect_rows(
                 rows,
                 self._current_mode(),
-                DetectionOptions(),
-                extract_prompts=self._image2tagger_checkbox.isChecked(),
+                self._detection_options(),
+                extract_prompts=False,
             )
             self._refresh_group_rows()
+            self._refresh_result_rows()
             self._refresh_report(reports)
+            if self._image2tagger_checkbox.isChecked():
+                self._start_prompt_worker([report.result_row for report in reports if report.result_row])
             if not rows:
                 self._show_info("No selected resolved groups are available.")
             elif not reports:
@@ -262,6 +328,136 @@ class RepairDocker(DockWidget):
     def _set_group_active(self, row: RepairGroupRow, active: bool) -> None:
         """Update a group row active flag from the UI."""
         row.active = bool(active)
+
+    def _select_all_results(self) -> None:
+        """Select all active detection result rows."""
+        self.result_selection_model.select_all()
+        self._refresh_result_rows()
+
+    def _clear_results(self) -> None:
+        """Clear selected detection result rows."""
+        self.result_selection_model.clear_selected()
+        self._refresh_result_rows()
+
+    def _refresh_result_rows(self) -> None:
+        """Render detection result rows with selected and active controls."""
+        while self._result_layout.count():
+            item = self._result_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+
+        rows = self.result_selection_model.rows
+        if not rows:
+            self._result_layout.addWidget(QLabel("No detection results yet."))
+            return
+
+        for row in rows:
+            self._result_layout.addWidget(self._build_result_row_widget(row))
+
+    def _build_result_row_widget(self, row: RepairResultRow) -> QWidget:
+        """Build one detection result row widget."""
+        row_widget = QWidget()
+        row_layout = QHBoxLayout()
+        row_widget.setLayout(row_layout)
+
+        selected = QCheckBox()
+        selected.setChecked(bool(row.selected))
+        selected.stateChanged.connect(
+            lambda _state, target=row, widget=selected: self._set_result_selected(
+                target,
+                widget.isChecked(),
+            )
+        )
+
+        active = QCheckBox("Active")
+        active.setChecked(bool(row.active))
+        active.stateChanged.connect(
+            lambda _state, target=row, widget=active: self._set_result_active(
+                target,
+                widget.isChecked(),
+            )
+        )
+
+        label = QLabel(
+            f"{row.display_name} | tag={row.prompt_status} | gen={row.generation_status}"
+        )
+        row_layout.addWidget(selected)
+        row_layout.addWidget(active)
+        row_layout.addWidget(label)
+        return row_widget
+
+    def _set_result_selected(self, row: RepairResultRow, selected: bool) -> None:
+        """Update a detection result row selected flag from the UI."""
+        row.selected = bool(selected)
+
+    def _set_result_active(self, row: RepairResultRow, active: bool) -> None:
+        """Update a detection result row active flag from the UI."""
+        row.active = bool(active)
+
+    def _extract_tags_for_selected_results(self) -> None:
+        """Start async image2tagger extraction for selected result rows."""
+        rows = self.result_selection_model.selected_active_results()
+        if not rows:
+            self._show_info("No selected detection results are available.")
+            return
+        self._start_prompt_worker(rows)
+
+    def _start_prompt_worker(self, rows: list[RepairResultRow]) -> None:
+        """Create and start a prompt extraction worker."""
+        self.prompt_worker = PromptExtractionWorker(
+            self.prompt_extraction_service,
+            on_progress=self._on_prompt_progress,
+            on_row_finished=self._on_prompt_row_finished,
+            on_completed=self._on_prompt_completed,
+        )
+        self.prompt_worker.enqueue(rows)
+        self._refresh_result_rows()
+        self.prompt_worker.start()
+
+    def _cancel_tag_extraction(self) -> None:
+        """Cancel queued prompt extraction work."""
+        if self.prompt_worker is not None:
+            self.prompt_worker.cancel()
+        self._refresh_result_rows()
+
+    def _on_prompt_progress(self, progress: PromptExtractionProgress) -> None:
+        """Update visible prompt extraction progress."""
+        self._prompt_progress_label.setText(
+            f"Prompt extraction: {progress.completed} / {progress.total}"
+        )
+
+    def _on_prompt_row_finished(self, row: RepairResultRow, _result: Any | None) -> None:
+        """Refresh one completed prompt row."""
+        self._refresh_result_rows()
+
+    def _on_prompt_completed(self, progress: PromptExtractionProgress) -> None:
+        """Refresh prompt extraction completion state."""
+        self._prompt_progress_label.setText(
+            f"Prompt extraction: {progress.completed} / {progress.total}"
+            + (" cancelled" if progress.cancelled else "")
+        )
+        self._refresh_result_rows()
+
+    def _generate_selected_results(self) -> None:
+        """Generate bbox repairs for selected detection result rows."""
+        rows = self.result_selection_model.selected_active_results()
+        if not rows:
+            self._show_info("No selected detection results are available.")
+            return
+
+        errors: list[str] = []
+        for row in rows:
+            try:
+                result = self.bbox_generation_service.generate_result_row(row)
+                if not result.success:
+                    errors.append(result.error)
+            except Exception as exc:
+                row.mark_generation_failed(str(exc))
+                errors.append(str(exc))
+        self._refresh_result_rows()
+        if errors:
+            self._show_error("\n".join(error for error in errors if error))
 
     def _refresh_report(self, reports: list[GroupDetectionReport]) -> None:
         """Render a traceable batch report."""
