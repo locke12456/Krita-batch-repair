@@ -4,12 +4,18 @@ from __future__ import annotations
 
 from typing import Any
 
+from .detection_layer_selection_model import DetectionLayerRow, DetectionLayerSelectionModel
+from .detection_service import DetectionOptions, DetectionService
 from .detector_model_manager import DetectorModelManager
+from .generation_trigger_service import GenerationTriggerService
+from .layer_metadata_service import LayerMetadataService
+from .prompt_extraction_service import PromptExtractionService
 from .repair_compat import (
     QCheckBox,
     QComboBox,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QMessageBox,
     QPushButton,
     QScrollArea,
@@ -32,17 +38,36 @@ class RepairDocker(DockWidget):
         except TypeError:
             super().__init__()
         self.detector_manager = DetectorModelManager()
+        self.selection_model = DetectionLayerSelectionModel()
+        self.metadata_service = LayerMetadataService()
+        self.detection_service = DetectionService(
+            self.detector_manager,
+            self.selection_model,
+            self.metadata_service,
+        )
+        self.prompt_extraction_service = PromptExtractionService(
+            self.selection_model,
+            self.metadata_service,
+        )
+        self.generation_trigger_service = GenerationTriggerService(
+            self.selection_model,
+            self.metadata_service,
+        )
         self._status_label = QLabel("Detector: unloaded")
         self._mode_combo = QComboBox()
+        self._workflow_path_input = QLineEdit()
+        self._workflow_path_input.setPlaceholderText("Image-to-text workflow JSON path")
         self._load_button = QPushButton("Load Detector")
         self._unload_button = QPushButton("Unload Detector")
         self._detect_button = QPushButton("Detect")
+        self._extract_prompt_button = QPushButton("Extract Prompt")
+        self._generate_button = QPushButton("Generate Selected")
         self._select_all_button = QPushButton("Select All")
         self._clear_selected_button = QPushButton("Clear Selected")
         self._row_scroll = QScrollArea()
         self._row_container = QWidget()
         self._row_layout = QVBoxLayout()
-        self._candidate_rows: list[dict[str, Any]] = []
+        self._candidate_rows: list[DetectionLayerRow] = self.selection_model.rows
         self._build_ui()
         self._connect_signals()
         self._refresh_status()
@@ -79,6 +104,16 @@ class RepairDocker(DockWidget):
         selection_row.addWidget(self._clear_selected_button)
         layout.addLayout(selection_row)
 
+        prompt_row = QHBoxLayout()
+        prompt_row.addWidget(QLabel("Prompt workflow JSON"))
+        prompt_row.addWidget(self._workflow_path_input)
+        layout.addLayout(prompt_row)
+
+        workflow_row = QHBoxLayout()
+        workflow_row.addWidget(self._extract_prompt_button)
+        workflow_row.addWidget(self._generate_button)
+        layout.addLayout(workflow_row)
+
         layout.addWidget(self._status_label)
 
         self._row_container.setLayout(self._row_layout)
@@ -97,7 +132,9 @@ class RepairDocker(DockWidget):
         """Wire button callbacks."""
         self._load_button.clicked.connect(self._load_detector)
         self._unload_button.clicked.connect(self._unload_detector)
-        self._detect_button.clicked.connect(self._detect_placeholder)
+        self._detect_button.clicked.connect(self._detect_candidates)
+        self._extract_prompt_button.clicked.connect(self._extract_prompts)
+        self._generate_button.clicked.connect(self._generate_selected)
         self._select_all_button.clicked.connect(self._select_all_rows)
         self._clear_selected_button.clicked.connect(self._clear_selected_rows)
         self._mode_combo.currentTextChanged.connect(self._refresh_candidate_rows)
@@ -106,6 +143,10 @@ class RepairDocker(DockWidget):
         """Return the current detector mode filter."""
         text = self._mode_combo.currentText()
         return str(text or "all").strip().lower() or "all"
+
+    def prompt_workflow_path(self) -> str:
+        """Return the configured image-to-text workflow JSON path."""
+        return str(self._workflow_path_input.text() or "").strip()
 
     def _load_detector(self) -> None:
         """Load or warm the detector backend for the selected mode."""
@@ -123,9 +164,47 @@ class RepairDocker(DockWidget):
         except Exception as exc:
             self._show_error(str(exc))
 
-    def _detect_placeholder(self) -> None:
-        """Phase 2 UI shell placeholder for the later detection service."""
-        self._show_info("Detection service is implemented in the next phase.")
+    def _detect_candidates(self) -> None:
+        """Run detection through DetectionService and refresh candidate rows."""
+        try:
+            rows = self.detection_service.detect_selected_layers(
+                self._current_mode(),
+                DetectionOptions(),
+            )
+            if not rows:
+                self._show_info("No detector candidates were found.")
+            self._refresh_candidate_rows()
+        except Exception as exc:
+            self._show_error(str(exc))
+
+    def _extract_prompts(self) -> None:
+        """Run prompt extraction for selected active rows."""
+        try:
+            workflow_path = self.prompt_workflow_path()
+            self.prompt_extraction_service.set_workflow_path(workflow_path)
+            results = self.prompt_extraction_service.run_for_selected(
+                workflow_path,
+                self._current_mode(),
+            )
+            failed = [result for result in results if not result.success]
+            self._refresh_candidate_rows()
+            if failed:
+                self._show_error("; ".join(result.error_message for result in failed))
+            elif not results:
+                self._show_info("No selected active candidates are available.")
+        except Exception as exc:
+            self._show_error(str(exc))
+
+    def _generate_selected(self) -> None:
+        """Trigger native krita-ai-diffusion generation for selected active rows."""
+        try:
+            self.generation_trigger_service.trigger_selected(
+                self._current_mode(),
+                execute=True,
+            )
+            self._refresh_candidate_rows()
+        except Exception as exc:
+            self._show_error(str(exc))
 
     def add_candidate_row(
         self,
@@ -136,14 +215,14 @@ class RepairDocker(DockWidget):
         selected: bool = True,
     ) -> None:
         """Add a candidate row to the Phase 2 row list."""
-        self._candidate_rows.append(
-            {
-                "layer_id": layer_id,
-                "layer_name": layer_name,
-                "mode": mode,
-                "selected": bool(selected),
-                "active": bool(active),
-            }
+        self.selection_model.add_row(
+            DetectionLayerRow(
+                layer_id=layer_id,
+                layer_name=layer_name,
+                mode=mode,
+                selected=bool(selected),
+                active=bool(active),
+            )
         )
         self._refresh_candidate_rows()
 
@@ -153,25 +232,21 @@ class RepairDocker(DockWidget):
         return [
             row
             for row in self._candidate_rows
-            if row.get("selected")
-            and row.get("active")
-            and (active_filter == "all" or row.get("mode") == active_filter)
+            if self._row_value(row, "selected")
+            and self._row_value(row, "active")
+            and (active_filter == "all" or self._row_value(row, "mode") == active_filter)
         ]
 
     def _select_all_rows(self) -> None:
         """Select all rows in the current mode filter."""
         active_filter = self._mode_combo.currentText()
-        for row in self._candidate_rows:
-            if active_filter == "all" or row.get("mode") == active_filter:
-                row["selected"] = True
+        self.selection_model.select_all(active_filter)
         self._refresh_candidate_rows()
 
     def _clear_selected_rows(self) -> None:
         """Clear selected rows in the current mode filter."""
         active_filter = self._mode_combo.currentText()
-        for row in self._candidate_rows:
-            if active_filter == "all" or row.get("mode") == active_filter:
-                row["selected"] = False
+        self.selection_model.clear_selected(active_filter)
         self._refresh_candidate_rows()
 
     def _refresh_candidate_rows(self) -> None:
@@ -185,7 +260,7 @@ class RepairDocker(DockWidget):
         active_filter = self._mode_combo.currentText()
         visible_rows = [
             row for row in self._candidate_rows
-            if active_filter == "all" or row.get("mode") == active_filter
+            if active_filter == "all" or self._row_value(row, "mode") == active_filter
         ]
 
         if not visible_rows:
@@ -198,7 +273,7 @@ class RepairDocker(DockWidget):
             row_widget.setLayout(row_layout)
 
             selected = QCheckBox()
-            selected.setChecked(bool(row.get("selected")))
+            selected.setChecked(bool(self._row_value(row, "selected")))
             selected.stateChanged.connect(
                 lambda _state, target=row, widget=selected: self._set_row_selected(
                     target,
@@ -207,7 +282,7 @@ class RepairDocker(DockWidget):
             )
 
             active = QCheckBox("Active")
-            active.setChecked(bool(row.get("active")))
+            active.setChecked(bool(self._row_value(row, "active")))
             active.stateChanged.connect(
                 lambda _state, target=row, widget=active: self._set_row_active(
                     target,
@@ -215,19 +290,35 @@ class RepairDocker(DockWidget):
                 )
             )
 
-            label = QLabel(f"{row.get('mode', '')}: {row.get('layer_name', row.get('layer_id', ''))}")
+            label = QLabel(
+                f"{self._row_value(row, 'mode', '')}: "
+                f"{self._row_value(row, 'layer_name', self._row_value(row, 'layer_id', ''))}"
+            )
             row_layout.addWidget(selected)
             row_layout.addWidget(active)
             row_layout.addWidget(label)
             self._row_layout.addWidget(row_widget)
 
-    def _set_row_selected(self, row: dict[str, Any], selected: bool) -> None:
+    def _set_row_selected(self, row: Any, selected: bool) -> None:
         """Update a row selected flag from the UI."""
-        row["selected"] = bool(selected)
+        self._set_row_value(row, "selected", bool(selected))
 
-    def _set_row_active(self, row: dict[str, Any], active: bool) -> None:
+    def _set_row_active(self, row: Any, active: bool) -> None:
         """Update a row active flag from the UI."""
-        row["active"] = bool(active)
+        self._set_row_value(row, "active", bool(active))
+
+    def _row_value(self, row: Any, key: str, default: Any = None) -> Any:
+        """Read a candidate row value from a dataclass row or legacy dict."""
+        if isinstance(row, dict):
+            return row.get(key, default)
+        return getattr(row, key, default)
+
+    def _set_row_value(self, row: Any, key: str, value: Any) -> None:
+        """Write a candidate row value to a dataclass row or legacy dict."""
+        if isinstance(row, dict):
+            row[key] = value
+            return
+        setattr(row, key, value)
 
     def _refresh_status(self) -> None:
         """Refresh detector status text."""

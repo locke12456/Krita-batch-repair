@@ -45,6 +45,7 @@ QCheckBox = qt_compat.QCheckBox
 QComboBox = qt_compat.QComboBox
 QHBoxLayout = qt_compat.QHBoxLayout
 QLabel = qt_compat.QLabel
+QLineEdit = qt_compat.QLineEdit
 QMessageBox = qt_compat.QMessageBox
 QPushButton = qt_compat.QPushButton
 QScrollArea = qt_compat.QScrollArea
@@ -133,6 +134,7 @@ __all__ = [
     "QComboBox",
     "QHBoxLayout",
     "QLabel",
+    "QLineEdit",
     "QMessageBox",
     "QPushButton",
     "QScrollArea",
