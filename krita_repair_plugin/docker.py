@@ -50,7 +50,10 @@ class RepairDocker(DockWidget):
         self.prompt_extraction_service = PromptExtractionService(
             metadata_service=self.metadata_service,
         )
-        self.bbox_generation_service = BBoxGenerationService()
+        self.bbox_generation_service = BBoxGenerationService(
+            metadata_service=self.metadata_service,
+            on_row_finished=self._on_generation_row_finished,
+        )
         self.group_batch_detection_service = GroupBatchDetectionService(
             self.detector_manager,
             self.metadata_service,
@@ -232,12 +235,6 @@ class RepairDocker(DockWidget):
     def _batch_detect_selected_groups(self) -> None:
         """Run detection for selected active group rows only."""
         try:
-            if self._generation_checkbox.isChecked():
-                self._show_error(
-                    "BBox-only generation is not implemented; refusing full-canvas redraw."
-                )
-                return
-
             rows = self.group_selection_model.selected_active_groups()
             reports = self.group_batch_detection_service.detect_rows(
                 rows,
@@ -438,6 +435,14 @@ class RepairDocker(DockWidget):
             + (" cancelled" if progress.cancelled else "")
         )
         self._refresh_result_rows()
+
+    def _on_generation_row_finished(self, row: RepairResultRow, result: Any) -> None:
+        """Refresh result rows after async bbox generation completes."""
+        self._refresh_result_rows()
+        if result is not None and not getattr(result, "success", False):
+            error = str(getattr(result, "error", "") or "")
+            if error:
+                self._show_error(error)
 
     def _generate_selected_results(self) -> None:
         """Generate bbox repairs for selected detection result rows."""
