@@ -15,6 +15,7 @@ class RepairGenerationTask:
     group_layer: Any
     source_layer: Any
     bbox: dict[str, int]
+    detector_bbox: dict[str, int]
     crop_png_bytes: bytes
     prompt_text: str
     detector_mode: str
@@ -96,6 +97,7 @@ class BBoxGenerationService:
             group_layer=row.group_layer,
             source_layer=row.source_layer,
             bbox=dict(row.crop_bbox),
+            detector_bbox=dict(getattr(row, "detector_bbox", {}) or {}),
             crop_png_bytes=bytes(row.crop_png_bytes),
             prompt_text=positive,
             detector_mode=str(row.detector_mode),
@@ -169,7 +171,7 @@ class BBoxGenerationService:
             )
             from ai_diffusion.client import resolve_arch
             from ai_diffusion.files import FileLibrary
-            from ai_diffusion.image import Bounds, Extent, Image
+            from ai_diffusion.image import Bounds, Extent, Image, multiple_of
             from ai_diffusion.jobs import JobParams
             from ai_diffusion.settings import settings
             from ai_diffusion.util import unique
@@ -186,9 +188,25 @@ class BBoxGenerationService:
                 f"bbox={bbox['width']}x{bbox['height']}."
             )
 
-        local_bounds = Bounds(0, 0, bbox["width"], bbox["height"])
+        # Comfy / latent workflows require diffusion-safe dimensions. If the bbox is
+        # 300x300, internal nodes may turn image tensors into 296x296 while the mask
+        # stays 300x300. Normalize the generation canvas to a multiple of 16 so image
+        # and mask share one stable size, then scale the final output back to crop_bbox.
+        generation_extent = Extent(
+            multiple_of(expected_extent.width, 16),
+            multiple_of(expected_extent.height, 16),
+        )
+        if generation_extent != expected_extent:
+            crop_image = Image.scale(crop_image, generation_extent)
+
+        local_bounds = Bounds(0, 0, generation_extent.width, generation_extent.height)
         doc_bounds = Bounds(bbox["x"], bbox["y"], bbox["width"], bbox["height"])
-        mask = self.build_bbox_local_mask(local_bounds)
+        mask = self.build_detector_local_mask(
+            crop_bbox=bbox,
+            detector_bbox=task.detector_bbox,
+            generation_extent=generation_extent,
+            original_extent=expected_extent,
+        )
 
         connection = getattr(model, "_connection")
         client = connection.client
@@ -260,6 +278,7 @@ class BBoxGenerationService:
                 "repair_plugin.result_id": str(getattr(task, "result_id", "") or ""),
                 "repair_plugin.detector_mode": task.detector_mode,
                 "repair_plugin.detector_label": task.detector_label,
+                "repair_plugin.detector_bbox": dict(task.detector_bbox),
                 "repair_plugin.crop_bbox": dict(bbox),
                 "repair_plugin.source_group_id": task.record.group_id,
                 "repair_plugin.source_group_name": task.record.group_name,
@@ -273,10 +292,48 @@ class BBoxGenerationService:
         return workflow_input, job_params
 
     def build_bbox_local_mask(self, local_bounds: Any) -> Any:
-        """Build a full-white bbox-local mask."""
+        """Build a full-white bbox-local mask fallback."""
         from ai_diffusion.image import Mask
 
         return Mask.rectangle(local_bounds, local_bounds)
+
+    def build_detector_local_mask(
+        self,
+        crop_bbox: dict[str, Any],
+        detector_bbox: dict[str, Any],
+        generation_extent: Any,
+        original_extent: Any,
+    ) -> Any:
+        """Build a mask for detector_bbox inside the bbox-local crop canvas.
+
+        crop_bbox is document-space and defines the crop image.
+        detector_bbox is document-space and defines the actual inpaint target.
+        generation_extent may be scaled to a diffusion-safe multiple of 16, so the
+        detector-local mask must be scaled by the same factor.
+        """
+        from ai_diffusion.image import Bounds, Mask
+
+        context = Bounds(0, 0, int(generation_extent.width), int(generation_extent.height))
+        if not detector_bbox:
+            return self.build_bbox_local_mask(context)
+
+        crop = self._normalized_bbox(crop_bbox)
+        detector = self._normalized_bbox(detector_bbox)
+        if detector["width"] <= 0 or detector["height"] <= 0:
+            return self.build_bbox_local_mask(context)
+
+        scale_x = float(generation_extent.width) / max(1, int(original_extent.width))
+        scale_y = float(generation_extent.height) / max(1, int(original_extent.height))
+        local_x = round((detector["x"] - crop["x"]) * scale_x)
+        local_y = round((detector["y"] - crop["y"]) * scale_y)
+        local_w = round(detector["width"] * scale_x)
+        local_h = round(detector["height"] * scale_y)
+
+        mask_bounds = Bounds(local_x, local_y, max(1, local_w), max(1, local_h))
+        mask_bounds = Bounds.restrict(mask_bounds, context)
+        if mask_bounds.width <= 0 or mask_bounds.height <= 0:
+            return self.build_bbox_local_mask(context)
+        return Mask.rectangle(mask_bounds, context)
 
     async def _enqueue_and_watch(
         self,
@@ -336,7 +393,23 @@ class BBoxGenerationService:
         output_image: Any,
         job_id: str = "",
     ) -> RepairGenerationResult:
-        self.validate_output_extent(task, output_image)
+        try:
+            from ai_diffusion.image import Extent, Image
+        except Exception as exc:
+            raise RuntimeError(f"ai-diffusion image API unavailable: {exc}") from exc
+
+        bbox = self._normalized_bbox(task.bbox)
+        expected_extent = Extent(bbox["width"], bbox["height"])
+        extent = getattr(output_image, "extent", None)
+        width = int(getattr(extent, "width", 0) or (extent[0] if extent else 0))
+        height = int(getattr(extent, "height", 0) or (extent[1] if extent else 0))
+        if width <= 0 or height <= 0:
+            raise RuntimeError("Generated image extent is invalid.")
+        if width != expected_extent.width or height != expected_extent.height:
+            # This is an explicit safe scale back from the internal multiple-of-16
+            # generation extent to the original document-space crop bbox extent.
+            output_image = Image.scale(output_image, expected_extent)
+
         output_png_bytes = bytes(output_image.to_bytes())
         result = self.apply_result_to_group(task, output_png_bytes)
         result.job_id = str(job_id or "")
