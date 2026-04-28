@@ -1,4 +1,4 @@
-"""Native krita-ai-diffusion generation handoff service."""
+"""BBox-only generation guard service."""
 
 from __future__ import annotations
 
@@ -29,7 +29,7 @@ class GenerationHandoffContext:
 
 
 class GenerationTriggerService:
-    """Bridge selected active candidate rows into existing ai-diffusion generation."""
+    """Guard generation so repair never falls back to full-canvas redraw."""
 
     def __init__(
         self,
@@ -92,10 +92,9 @@ class GenerationTriggerService:
         self._write_handoff_metadata(context)
 
         if execute:
-            model = self._active_model()
-            self._apply_candidate_context(model, context)
-            self._install_result_metadata_hook(model, context)
-            self._call_native_generation(model, queue_mode)
+            raise RuntimeError(
+                "BBox-only generation is not implemented; refusing full-canvas redraw."
+            )
 
         for row in context.rows:
             row.generation_status = GENERATION_STATUS_QUEUED
@@ -124,18 +123,10 @@ class GenerationTriggerService:
             try_set_preview_layer(primary.layer_id)
 
     def _call_native_generation(self, model: Any, queue_mode: str) -> None:
-        """Call verified native generation entry points only."""
-        normalized_queue = str(queue_mode or "back").strip().lower()
-        if normalized_queue == "replace":
-            generate_replace = getattr(model, "generate_replace", None)
-            if callable(generate_replace):
-                generate_replace()
-                return
-
-        generate = getattr(model, "generate", None)
-        if not callable(generate):
-            raise RuntimeError("Active model does not expose generate()")
-        generate()
+        """Native generation is disabled because it can redraw the full canvas."""
+        raise RuntimeError(
+            "BBox-only generation is not implemented; refusing full-canvas redraw."
+        )
 
 
     def _install_result_metadata_hook(

@@ -43,7 +43,11 @@ class DetectionOptions:
 
 
 class DetectionService:
-    """Resolve target layers, run detector, create candidate layers, and add rows."""
+    """Detection utility service.
+
+    The SyncRecord group batch workflow owns source selection and result
+    placement. Candidate row creation is retained only for legacy/debug use.
+    """
 
     def __init__(
         self,
@@ -55,29 +59,59 @@ class DetectionService:
         self.selection_model = selection_model or DetectionLayerSelectionModel()
         self.metadata_service = metadata_service
 
+    def detect_projection(
+        self,
+        mode: str,
+        source_layer: Any,
+        options: DetectionOptions | dict[str, Any] | None = None,
+    ) -> list[DetectionResult]:
+        """Detect objects on an explicit source layer without creating UI rows."""
+        projection, _image_bytes, _projection_bounds = self.render_projection_input(source_layer)
+        detection_options = self._normalize_options(options)
+        return self.detector_manager.detect_layer(
+            mode,
+            projection,
+            detection_options.to_detector_options(),
+        )
+
+    def crop_bbox(
+        self,
+        png_bytes: bytes,
+        bbox: BoundingBox,
+    ) -> bytes | None:
+        """Crop PNG bytes to the detector bbox."""
+        return self._crop_png_bytes(png_bytes, bbox)
+
+    def render_projection_input(
+        self,
+        source_layer: Any,
+    ) -> tuple[LayerProjectionInput, bytes, Any]:
+        """Render one explicit layer and return detector projection input."""
+        rendered = render_node_projection(source_layer)
+        projection_bounds = rendered.bounds
+        image_bytes = bytes(rendered.to_bytes())
+        projection = LayerProjectionInput(
+            layer_id=str(source_layer.id_string),
+            layer_name=str(source_layer.name),
+            bounds=projection_bounds,
+            image_bytes=image_bytes,
+            coordinate_space="projection",
+        )
+        return projection, image_bytes, projection_bounds
+
     def detect_layer(
         self,
         mode: str,
         source_layer: Any | None = None,
         options: DetectionOptions | dict[str, Any] | None = None,
     ) -> list[DetectionLayerRow]:
-        """Detect candidates on one source layer and create candidate rows."""
+        """Legacy/debug-only: detect one layer and create candidate rows."""
         document_ref = active_krita_document()
         if document_ref is None:
             raise RuntimeError("No active Krita document is available")
 
         node_ref = source_layer or self._selected_source_layer()
-        rendered = render_node_projection(node_ref)
-        projection_bounds = rendered.bounds
-        image_bytes = bytes(rendered.to_bytes())
-
-        projection = LayerProjectionInput(
-            layer_id=str(node_ref.id_string),
-            layer_name=str(node_ref.name),
-            bounds=projection_bounds,
-            image_bytes=image_bytes,
-            coordinate_space="projection",
-        )
+        projection, image_bytes, projection_bounds = self.render_projection_input(node_ref)
 
         detection_options = self._normalize_options(options)
         raw_results = self.detector_manager.detect_layer(
@@ -106,7 +140,7 @@ class DetectionService:
         mode: str,
         options: DetectionOptions | dict[str, Any] | None = None,
     ) -> list[DetectionLayerRow]:
-        """Run detection over all currently selected Krita layers."""
+        """Legacy/debug-only: run detection over currently selected Krita layers."""
         selected = selected_krita_nodes()
         if not selected:
             return self.detect_layer(mode, None, options)

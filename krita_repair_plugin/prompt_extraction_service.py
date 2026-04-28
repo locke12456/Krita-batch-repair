@@ -19,6 +19,45 @@ STANDARD_TAGGER_NODE_ID = "2"
 STANDARD_OUTPUT_NODE_ID = "3"
 STANDARD_IMAGE_INPUT_KEY = "image"
 
+IMAGE2TAGGER_WORKFLOW_TEMPLATE = {
+    "1": {
+        "inputs": {
+            "image": "",
+        },
+        "class_type": "ETN_LoadImageBase64",
+        "_meta": {
+            "title": "Input Image Base64",
+        },
+    },
+    "2": {
+        "inputs": {
+            "model": "wd-eva02-large-tagger-v3",
+            "threshold": 0.8,
+            "character_threshold": 0.85,
+            "replace_underscore": False,
+            "trailing_comma": False,
+            "exclude_tags": "uncensored, mosaic_censoring, censored",
+            "tags": "",
+            "image": ["1", 0],
+        },
+        "class_type": "WD14Tagger|pysssss",
+        "_meta": {
+            "title": "WD14 Prompt Tagger",
+        },
+    },
+    "3": {
+        "inputs": {
+            "preview": "",
+            "previewMode": False,
+            "source": ["2", 0],
+        },
+        "class_type": "PreviewAny",
+        "_meta": {
+            "title": "Prompt Text Output",
+        },
+    },
+}
+
 
 @dataclass(frozen=True, slots=True)
 class PromptExtractionResult:
@@ -99,18 +138,55 @@ class PromptExtractionService:
         self.selection_model = selection_model
         self.metadata_service = metadata_service
         self.client_factory = client_factory or PromptWorkflowClient
-        self.workflow_path = str(workflow_path or "")
 
     def set_workflow_path(self, workflow_path: str) -> None:
-        """Set the image-to-text workflow JSON path used by prompt extraction."""
-        self.workflow_path = str(workflow_path or "").strip()
+        """Compatibility no-op; prompt extraction uses the built-in workflow."""
+        return None
 
-    def _resolve_workflow_path(self, workflow_path: str | None = None) -> str:
-        """Resolve explicit workflow path, then configured service path."""
-        path = str(workflow_path or self.workflow_path or "").strip()
-        if not path:
-            raise RuntimeError("Prompt workflow JSON path is not configured")
-        return path
+    def build_image2tagger_workflow(self, image_base64: str = "") -> dict[str, Any]:
+        """Return the built-in image2tagger workflow with optional image injection."""
+        workflow = copy.deepcopy(IMAGE2TAGGER_WORKFLOW_TEMPLATE)
+        workflow[STANDARD_IMAGE_NODE_ID]["inputs"][STANDARD_IMAGE_INPUT_KEY] = image_base64
+        return workflow
+
+    def extract_prompt_from_bytes(
+        self,
+        layer_id: str,
+        image_bytes: bytes,
+    ) -> PromptExtractionResult:
+        """Run prompt extraction directly from bbox crop PNG bytes."""
+        if not image_bytes:
+            return PromptExtractionResult(
+                layer_id=str(layer_id),
+                prompt_text="",
+                raw_output=None,
+                success=False,
+                error_message="Image bytes are required",
+            )
+
+        try:
+            workflow = self.build_image2tagger_workflow()
+            client = self.client_factory(self.connected_comfy_url())
+            runtime_workflow = self.inject_image(workflow, image_bytes)
+            prompt_id = client.submit(runtime_workflow)
+            raw_output = client.wait(prompt_id)
+            prompt_text = self.parse_prompt_output(raw_output, prompt_id)
+            if not prompt_text:
+                raise RuntimeError("Runtime output did not contain prompt text")
+            return PromptExtractionResult(
+                layer_id=str(layer_id),
+                prompt_text=prompt_text,
+                raw_output=raw_output,
+                success=True,
+            )
+        except Exception as exc:
+            return PromptExtractionResult(
+                layer_id=str(layer_id),
+                prompt_text="",
+                raw_output=None,
+                success=False,
+                error_message=str(exc),
+            )
 
     def run_for_selected(
         self,
@@ -121,7 +197,7 @@ class PromptExtractionService:
         if self.selection_model is None:
             raise RuntimeError("selection_model is required")
         rows = self.selection_model.selected_active_rows(filter_mode)
-        return self.run_for_rows(rows, workflow_path)
+        return self.run_for_rows(rows, None)
 
     def run_for_rows(
         self,
@@ -129,7 +205,7 @@ class PromptExtractionService:
         workflow_path: str | None = None,
     ) -> list[PromptExtractionResult]:
         """Run prompt extraction for explicit rows."""
-        workflow = self.load_workflow(self._resolve_workflow_path(workflow_path))
+        workflow = self.build_image2tagger_workflow()
         base_url = self.connected_comfy_url()
         client = self.client_factory(base_url)
 
@@ -183,7 +259,7 @@ class PromptExtractionService:
         return result
 
     def load_workflow(self, workflow_path: str) -> dict[str, Any]:
-        """Load workflow JSON from disk."""
+        """Compatibility helper; runtime prompt extraction uses the built-in workflow."""
         with open(workflow_path, "r", encoding="utf-8") as handle:
             workflow = json.load(handle)
         self.validate_standard_workflow(workflow)

@@ -37,6 +37,12 @@ class LayerMetadataService:
         "Attach post-completion generation metadata to a generated result layer."
         return self._merge_metadata(layer_ref, "result", metadata)
 
+    def attach_group_batch_result_metadata(self, layer_ref: Any, metadata: dict[str, Any]) -> dict[str, Any]:
+        "Attach SyncRecord group batch result metadata to a repair layer."
+        payload = self._merge_metadata(layer_ref, "group_batch_result", metadata)
+        self._append_group_batch_result(layer_ref, payload)
+        return payload
+
     def metadata_for_layer(self, layer_ref: Any) -> dict[str, Any]:
         "Return a copy of metadata for a layer reference or layer id."
         layer_id = self._layer_id(layer_ref)
@@ -123,6 +129,44 @@ class LayerMetadataService:
         except Exception:
             return
 
+    def _append_group_batch_result(self, layer_ref: Any, payload: dict[str, Any]) -> None:
+        "Append repair batch result data to an existing group SyncRecord when possible."
+        if SyncMapStore is None:
+            return
+
+        document = self._document_for_layer(layer_ref)
+        if document is None:
+            return
+
+        group_id = payload.get(schema.KEY_SOURCE_GROUP_ID) or payload.get("repair_plugin.source_group_id")
+        group_name = payload.get(schema.KEY_SOURCE_GROUP_NAME) or payload.get("repair_plugin.source_group_name")
+
+        try:
+            document_key = id(document)
+            store = self._sync_store_by_document_id.get(document_key)
+            if store is None:
+                store = SyncMapStore(document)
+                self._sync_store_by_document_id[document_key] = store
+            record = store.resolve_group(
+                str(group_id) if group_id else None,
+                str(group_name) if group_name else None,
+            )
+        except Exception:
+            return
+
+        if record is None:
+            return
+
+        try:
+            snapshot = dict(getattr(record, "params_snapshot", {}) or {})
+            results = list(snapshot.get("repair_batch_results", []) or [])
+            results.append(self._json_safe(payload))
+            snapshot["repair_batch_results"] = results
+            record.params_snapshot = snapshot
+            store.record_apply(record)
+        except Exception:
+            return
+
     def _document_for_layer(self, layer_ref: Any) -> Any:
         "Resolve the live Krita document from a layer reference when available."
         document_ref = getattr(layer_ref, "document_ref", None)
@@ -172,6 +216,26 @@ class LayerMetadataService:
             schema.KEY_RESULT_LAYER_NAME,
             schema.KEY_CANDIDATE_LAYER_IDS,
             schema.KEY_ERROR_MESSAGE,
+            schema.KEY_SOURCE_GROUP_ID,
+            schema.KEY_SOURCE_GROUP_NAME,
+            schema.KEY_EXPORT_KEY,
+            schema.KEY_SOURCE_LAYER_ID,
+            schema.KEY_SOURCE_LAYER_NAME,
+            schema.KEY_CREATED_LAYER_ID,
+            schema.KEY_CREATED_LAYER_NAME,
+            "repair_plugin.schema_version",
+            "repair_plugin.source_group_id",
+            "repair_plugin.source_group_name",
+            "repair_plugin.export_key",
+            "repair_plugin.source_layer_id",
+            "repair_plugin.source_layer_name",
+            "repair_plugin.detector_mode",
+            "repair_plugin.detector_label",
+            "repair_plugin.detector_bbox",
+            "repair_plugin.detector_score",
+            "repair_plugin.prompt_text",
+            "repair_plugin.created_layer_id",
+            "repair_plugin.created_layer_name",
             "visible",
         }
         return {

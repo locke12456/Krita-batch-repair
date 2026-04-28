@@ -4,10 +4,12 @@ from __future__ import annotations
 
 from typing import Any
 
-from .detection_layer_selection_model import DetectionLayerRow, DetectionLayerSelectionModel
-from .detection_service import DetectionOptions, DetectionService
+from .bbox_generation_service import BBoxGenerationService
+from .detection_service import DetectionOptions
 from .detector_model_manager import DetectorModelManager
-from .generation_trigger_service import GenerationTriggerService
+from .group_batch_detection_service import GroupBatchDetectionService, GroupDetectionReport
+from .group_selection_model import GroupSelectionModel, RepairGroupRow
+from .group_sync_source import GroupSyncSource
 from .layer_metadata_service import LayerMetadataService
 from .prompt_extraction_service import PromptExtractionService
 from .repair_compat import (
@@ -15,7 +17,6 @@ from .repair_compat import (
     QComboBox,
     QHBoxLayout,
     QLabel,
-    QLineEdit,
     QMessageBox,
     QPushButton,
     QScrollArea,
@@ -30,44 +31,42 @@ except Exception:
 
 
 class RepairDocker(DockWidget):
-    """UI shell for detector residency and candidate workflow controls."""
+    """UI shell for SyncRecord group batch detection."""
 
     def __init__(self, parent: Any = None) -> None:
         try:
             super().__init__(parent)
         except TypeError:
             super().__init__()
+
         self.detector_manager = DetectorModelManager()
-        self.selection_model = DetectionLayerSelectionModel()
+        self.group_selection_model = GroupSelectionModel()
         self.metadata_service = LayerMetadataService()
-        self.detection_service = DetectionService(
-            self.detector_manager,
-            self.selection_model,
-            self.metadata_service,
-        )
         self.prompt_extraction_service = PromptExtractionService(
-            self.selection_model,
-            self.metadata_service,
+            metadata_service=self.metadata_service,
         )
-        self.generation_trigger_service = GenerationTriggerService(
-            self.selection_model,
+        self.bbox_generation_service = BBoxGenerationService()
+        self.group_batch_detection_service = GroupBatchDetectionService(
+            self.detector_manager,
             self.metadata_service,
+            self.prompt_extraction_service,
         )
+
         self._status_label = QLabel("Detector: unloaded")
         self._mode_combo = QComboBox()
-        self._workflow_path_input = QLineEdit()
-        self._workflow_path_input.setPlaceholderText("Image-to-text workflow JSON path")
+        self._refresh_groups_button = QPushButton("Refresh Groups")
         self._load_button = QPushButton("Load Detector")
         self._unload_button = QPushButton("Unload Detector")
-        self._detect_button = QPushButton("Detect")
-        self._extract_prompt_button = QPushButton("Extract Prompt")
-        self._generate_button = QPushButton("Generate Selected")
-        self._select_all_button = QPushButton("Select All")
-        self._clear_selected_button = QPushButton("Clear Selected")
+        self._detect_button = QPushButton("Batch Detect Selected Groups")
+        self._image2tagger_checkbox = QCheckBox("Use image2tagger prompt")
+        self._generation_checkbox = QCheckBox("Generate bbox repair")
+        self._select_all_button = QPushButton("Select All Groups")
+        self._clear_selected_button = QPushButton("Clear Groups")
         self._row_scroll = QScrollArea()
         self._row_container = QWidget()
         self._row_layout = QVBoxLayout()
-        self._candidate_rows: list[DetectionLayerRow] = self.selection_model.rows
+        self._report_label = QLabel("Batch Report: no run yet.")
+
         self._build_ui()
         self._connect_signals()
         self._refresh_status()
@@ -77,7 +76,7 @@ class RepairDocker(DockWidget):
         return None
 
     def _build_ui(self) -> None:
-        """Build the Phase 2 shell widgets."""
+        """Build the SyncRecord group batch UI."""
         if hasattr(self, "setWindowTitle"):
             self.setWindowTitle("Auto Detect Repair")
 
@@ -88,6 +87,8 @@ class RepairDocker(DockWidget):
         layout = QVBoxLayout()
         root.setLayout(layout)
 
+        layout.addWidget(self._refresh_groups_button)
+
         detector_row = QHBoxLayout()
         detector_row.addWidget(self._load_button)
         detector_row.addWidget(self._unload_button)
@@ -96,7 +97,6 @@ class RepairDocker(DockWidget):
         mode_row = QHBoxLayout()
         mode_row.addWidget(QLabel("Mode"))
         mode_row.addWidget(self._mode_combo)
-        mode_row.addWidget(self._detect_button)
         layout.addLayout(mode_row)
 
         selection_row = QHBoxLayout()
@@ -104,24 +104,21 @@ class RepairDocker(DockWidget):
         selection_row.addWidget(self._clear_selected_button)
         layout.addLayout(selection_row)
 
-        prompt_row = QHBoxLayout()
-        prompt_row.addWidget(QLabel("Prompt workflow JSON"))
-        prompt_row.addWidget(self._workflow_path_input)
-        layout.addLayout(prompt_row)
+        option_row = QHBoxLayout()
+        option_row.addWidget(self._image2tagger_checkbox)
+        option_row.addWidget(self._generation_checkbox)
+        layout.addLayout(option_row)
 
-        workflow_row = QHBoxLayout()
-        workflow_row.addWidget(self._extract_prompt_button)
-        workflow_row.addWidget(self._generate_button)
-        layout.addLayout(workflow_row)
-
+        layout.addWidget(self._detect_button)
         layout.addWidget(self._status_label)
 
         self._row_container.setLayout(self._row_layout)
         self._row_scroll.setWidget(self._row_container)
         self._row_scroll.setWidgetResizable(True)
-        layout.addWidget(QLabel("Candidate Layers"))
+        layout.addWidget(QLabel("Group List"))
         layout.addWidget(self._row_scroll)
-        self._refresh_candidate_rows()
+        layout.addWidget(self._report_label)
+        self._refresh_group_rows()
 
         if hasattr(self, "setWidget"):
             self.setWidget(root)
@@ -130,23 +127,28 @@ class RepairDocker(DockWidget):
 
     def _connect_signals(self) -> None:
         """Wire button callbacks."""
+        self._refresh_groups_button.clicked.connect(self._refresh_groups)
         self._load_button.clicked.connect(self._load_detector)
         self._unload_button.clicked.connect(self._unload_detector)
-        self._detect_button.clicked.connect(self._detect_candidates)
-        self._extract_prompt_button.clicked.connect(self._extract_prompts)
-        self._generate_button.clicked.connect(self._generate_selected)
-        self._select_all_button.clicked.connect(self._select_all_rows)
-        self._clear_selected_button.clicked.connect(self._clear_selected_rows)
-        self._mode_combo.currentTextChanged.connect(self._refresh_candidate_rows)
+        self._detect_button.clicked.connect(self._batch_detect_selected_groups)
+        self._select_all_button.clicked.connect(self._select_all_groups)
+        self._clear_selected_button.clicked.connect(self._clear_groups)
 
     def _current_mode(self) -> str:
         """Return the current detector mode filter."""
         text = self._mode_combo.currentText()
         return str(text or "all").strip().lower() or "all"
 
-    def prompt_workflow_path(self) -> str:
-        """Return the configured image-to-text workflow JSON path."""
-        return str(self._workflow_path_input.text() or "").strip()
+    def _refresh_groups(self) -> None:
+        """Load group-backed SyncRecord rows from the active document."""
+        try:
+            rows = GroupSyncSource().load_rows()
+            self.group_selection_model.replace_rows(rows)
+            self._refresh_group_rows()
+            if not rows:
+                self._show_info("No group-backed SyncRecord rows were found.")
+        except Exception as exc:
+            self._show_error(str(exc))
 
     def _load_detector(self) -> None:
         """Load or warm the detector backend for the selected mode."""
@@ -164,161 +166,138 @@ class RepairDocker(DockWidget):
         except Exception as exc:
             self._show_error(str(exc))
 
-    def _detect_candidates(self) -> None:
-        """Run detection through DetectionService and refresh candidate rows."""
+    def _batch_detect_selected_groups(self) -> None:
+        """Run detection for selected active group rows only."""
         try:
-            rows = self.detection_service.detect_selected_layers(
+            if self._generation_checkbox.isChecked():
+                self._show_error(
+                    "BBox-only generation is not implemented; refusing full-canvas redraw."
+                )
+                return
+
+            rows = self.group_selection_model.selected_active_groups()
+            reports = self.group_batch_detection_service.detect_rows(
+                rows,
                 self._current_mode(),
                 DetectionOptions(),
+                extract_prompts=self._image2tagger_checkbox.isChecked(),
             )
+            self._refresh_group_rows()
+            self._refresh_report(reports)
             if not rows:
-                self._show_info("No detector candidates were found.")
-            self._refresh_candidate_rows()
+                self._show_info("No selected resolved groups are available.")
+            elif not reports:
+                self._show_info("No detector results were created.")
         except Exception as exc:
             self._show_error(str(exc))
 
-    def _extract_prompts(self) -> None:
-        """Run prompt extraction for selected active rows."""
-        try:
-            workflow_path = self.prompt_workflow_path()
-            self.prompt_extraction_service.set_workflow_path(workflow_path)
-            results = self.prompt_extraction_service.run_for_selected(
-                workflow_path,
-                self._current_mode(),
-            )
-            failed = [result for result in results if not result.success]
-            self._refresh_candidate_rows()
-            if failed:
-                self._show_error("; ".join(result.error_message for result in failed))
-            elif not results:
-                self._show_info("No selected active candidates are available.")
-        except Exception as exc:
-            self._show_error(str(exc))
+    def _select_all_groups(self) -> None:
+        """Select all resolved group rows."""
+        self.group_selection_model.select_all()
+        self._refresh_group_rows()
 
-    def _generate_selected(self) -> None:
-        """Trigger native krita-ai-diffusion generation for selected active rows."""
-        try:
-            self.generation_trigger_service.trigger_selected(
-                self._current_mode(),
-                execute=True,
-            )
-            self._refresh_candidate_rows()
-        except Exception as exc:
-            self._show_error(str(exc))
+    def _clear_groups(self) -> None:
+        """Clear selected group rows."""
+        self.group_selection_model.clear_selected()
+        self._refresh_group_rows()
 
-    def add_candidate_row(
-        self,
-        layer_id: str,
-        layer_name: str,
-        mode: str,
-        active: bool = True,
-        selected: bool = True,
-    ) -> None:
-        """Add a candidate row to the Phase 2 row list."""
-        self.selection_model.add_row(
-            DetectionLayerRow(
-                layer_id=layer_id,
-                layer_name=layer_name,
-                mode=mode,
-                selected=bool(selected),
-                active=bool(active),
-            )
-        )
-        self._refresh_candidate_rows()
-
-    def selected_active_rows(self, filter_mode: str | None = None) -> list[dict[str, Any]]:
-        """Return currently selected and active rows."""
-        active_filter = filter_mode or self._mode_combo.currentText()
-        return [
-            row
-            for row in self._candidate_rows
-            if self._row_value(row, "selected")
-            and self._row_value(row, "active")
-            and (active_filter == "all" or self._row_value(row, "mode") == active_filter)
-        ]
-
-    def _select_all_rows(self) -> None:
-        """Select all rows in the current mode filter."""
-        active_filter = self._mode_combo.currentText()
-        self.selection_model.select_all(active_filter)
-        self._refresh_candidate_rows()
-
-    def _clear_selected_rows(self) -> None:
-        """Clear selected rows in the current mode filter."""
-        active_filter = self._mode_combo.currentText()
-        self.selection_model.clear_selected(active_filter)
-        self._refresh_candidate_rows()
-
-    def _refresh_candidate_rows(self) -> None:
-        """Render candidate rows with selected and active controls."""
+    def _refresh_group_rows(self) -> None:
+        """Render SyncRecord group rows with selected and active controls."""
         while self._row_layout.count():
             item = self._row_layout.takeAt(0)
             widget = item.widget()
             if widget is not None:
                 widget.deleteLater()
 
-        active_filter = self._mode_combo.currentText()
-        visible_rows = [
-            row for row in self._candidate_rows
-            if active_filter == "all" or self._row_value(row, "mode") == active_filter
+        rows = self.group_selection_model.rows
+        if not rows:
+            self._row_layout.addWidget(QLabel("No group rows yet. Click Refresh Groups."))
+            return
+
+        for row in rows:
+            self._row_layout.addWidget(self._build_group_row_widget(row))
+
+    def _build_group_row_widget(self, row: RepairGroupRow) -> QWidget:
+        """Build one group row widget."""
+        row_widget = QWidget()
+        row_layout = QHBoxLayout()
+        row_widget.setLayout(row_layout)
+
+        selected = QCheckBox()
+        selected.setChecked(bool(row.selected))
+        selected.setEnabled(row.is_resolved)
+        selected.stateChanged.connect(
+            lambda _state, target=row, widget=selected: self._set_group_selected(
+                target,
+                widget.isChecked(),
+            )
+        )
+
+        active = QCheckBox("Active")
+        active.setChecked(bool(row.active))
+        active.stateChanged.connect(
+            lambda _state, target=row, widget=active: self._set_group_active(
+                target,
+                widget.isChecked(),
+            )
+        )
+
+        resolved = "resolved" if row.is_resolved else "unresolved"
+        warnings = "; ".join(row.warnings)
+        label = QLabel(
+            f"#{row.sync_index} | {row.display_name} | {row.export_key} | "
+            f"layers={len(row.layer_ids)} | {resolved} | created={row.detected_count}"
+            + (f" | {warnings}" if warnings else "")
+        )
+
+        row_layout.addWidget(selected)
+        row_layout.addWidget(active)
+        row_layout.addWidget(label)
+        return row_widget
+
+    def _set_group_selected(self, row: RepairGroupRow, selected: bool) -> None:
+        """Update a group row selected flag from the UI."""
+        row.selected = bool(selected)
+
+    def _set_group_active(self, row: RepairGroupRow, active: bool) -> None:
+        """Update a group row active flag from the UI."""
+        row.active = bool(active)
+
+    def _refresh_report(self, reports: list[GroupDetectionReport]) -> None:
+        """Render a traceable batch report."""
+        if not reports:
+            self._report_label.setText("Batch Report: no detector results.")
+            return
+
+        created = [report for report in reports if report.created_layer_id]
+        failed = [report for report in reports if report.error]
+        lines = [
+            f"Batch Report: created={len(created)}, failed={len(failed)}, total={len(reports)}"
         ]
 
-        if not visible_rows:
-            self._row_layout.addWidget(QLabel("No candidate rows yet."))
-            return
-
-        for row in visible_rows:
-            row_widget = QWidget()
-            row_layout = QHBoxLayout()
-            row_widget.setLayout(row_layout)
-
-            selected = QCheckBox()
-            selected.setChecked(bool(self._row_value(row, "selected")))
-            selected.stateChanged.connect(
-                lambda _state, target=row, widget=selected: self._set_row_selected(
-                    target,
-                    widget.isChecked(),
+        for report in reports[:12]:
+            bbox = report.bbox or {}
+            bbox_text = (
+                f"{bbox.get('x', '?')},{bbox.get('y', '?')},"
+                f"{bbox.get('width', '?')}x{bbox.get('height', '?')}"
+            )
+            if report.error:
+                lines.append(
+                    f"[x] {report.group_name or report.export_key} | "
+                    f"{report.source_layer_name} | {bbox_text} | {report.error}"
                 )
-            )
-
-            active = QCheckBox("Active")
-            active.setChecked(bool(self._row_value(row, "active")))
-            active.stateChanged.connect(
-                lambda _state, target=row, widget=active: self._set_row_active(
-                    target,
-                    widget.isChecked(),
+            else:
+                lines.append(
+                    f"[+] {report.group_name or report.export_key} | "
+                    f"{report.source_layer_name} | {bbox_text} | "
+                    f"{report.created_layer_name or report.created_layer_id}"
                 )
-            )
 
-            label = QLabel(
-                f"{self._row_value(row, 'mode', '')}: "
-                f"{self._row_value(row, 'layer_name', self._row_value(row, 'layer_id', ''))}"
-            )
-            row_layout.addWidget(selected)
-            row_layout.addWidget(active)
-            row_layout.addWidget(label)
-            self._row_layout.addWidget(row_widget)
+        remaining = len(reports) - 12
+        if remaining > 0:
+            lines.append(f"... {remaining} more result(s)")
 
-    def _set_row_selected(self, row: Any, selected: bool) -> None:
-        """Update a row selected flag from the UI."""
-        self._set_row_value(row, "selected", bool(selected))
-
-    def _set_row_active(self, row: Any, active: bool) -> None:
-        """Update a row active flag from the UI."""
-        self._set_row_value(row, "active", bool(active))
-
-    def _row_value(self, row: Any, key: str, default: Any = None) -> Any:
-        """Read a candidate row value from a dataclass row or legacy dict."""
-        if isinstance(row, dict):
-            return row.get(key, default)
-        return getattr(row, key, default)
-
-    def _set_row_value(self, row: Any, key: str, value: Any) -> None:
-        """Write a candidate row value to a dataclass row or legacy dict."""
-        if isinstance(row, dict):
-            row[key] = value
-            return
-        setattr(row, key, value)
+        self._report_label.setText("\n".join(lines))
 
     def _refresh_status(self) -> None:
         """Refresh detector status text."""

@@ -76,6 +76,59 @@ def active_document_any() -> Any:
     return active_krita_document()
 
 
+def add_repair_result_layer_to_group(
+    document_ref: Any,
+    group_layer: Any,
+    source_layer: Any,
+    name: str,
+    png_bytes: bytes,
+    x: int = 0,
+    y: int = 0,
+) -> Any:
+    """Add a repair result layer under the original group at document coordinates."""
+    if document_ref is None:
+        raise RuntimeError("Document reference is required.")
+    if group_layer is None:
+        raise RuntimeError("Group layer is required; refusing root-level repair layer.")
+
+    parent_node = getattr(group_layer, "node", group_layer)
+    if parent_node is None:
+        raise RuntimeError("Group node is required; refusing root-level repair layer.")
+
+    above_node = getattr(source_layer, "node", None)
+    created_layer = add_layer_only_paint_layer(
+        document_ref=document_ref,
+        name=name,
+        png_bytes=None,
+        parent_node=parent_node,
+        above_node=above_node,
+    )
+
+    if not png_bytes:
+        return created_layer
+
+    node = getattr(created_layer, "node", created_layer)
+    set_pixel_data = getattr(node, "setPixelData", None)
+    if not callable(set_pixel_data):
+        raise RuntimeError("Created layer does not expose setPixelData.")
+
+    image = QtGui.QImage()
+    if not image.loadFromData(png_bytes, "PNG"):
+        raise ValueError("Repair result PNG bytes could not be decoded.")
+
+    image = image.convertToFormat(qt_compat.image_format_argb32())
+    width = int(image.width())
+    height = int(image.height())
+    ptr = image.bits()
+    try:
+        ptr.setsize(image.sizeInBytes())
+    except Exception:
+        ptr.setsize(image.byteCount())
+
+    set_pixel_data(qt_compat.QByteArray(bytes(ptr)), int(x), int(y), width, height)
+    document_ref.refresh_projection()
+    return created_layer
+
 
 __all__ = [
     "QAction",
@@ -105,6 +158,7 @@ __all__ = [
     "ai_diffusion_available",
     "ai_diffusion_error",
     "add_layer_only_paint_layer",
+    "add_repair_result_layer_to_group",
     "all_krita_nodes",
     "checked_state",
     "deserialize_job_params",
