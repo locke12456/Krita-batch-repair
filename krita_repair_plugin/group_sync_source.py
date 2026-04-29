@@ -25,10 +25,16 @@ class GroupSyncSource:
 
     def load_rows(self) -> list[RepairGroupRow]:
         self.sync_map_store.load()
+        records = self.sync_map_store.all_records()
+        try:
+            self.repair_state_store.migrate_from_sync_records(records)
+        except Exception:
+            pass
+
         rows: list[RepairGroupRow] = []
         seen_records: set[tuple[str, str, str, int]] = set()
 
-        for record in self.sync_map_store.all_records():
+        for record in records:
             if record.target_type != "group":
                 continue
 

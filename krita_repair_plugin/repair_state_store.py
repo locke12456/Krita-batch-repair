@@ -8,7 +8,8 @@ from typing import Any
 from .repair_compat import qt_compat
 
 
-ANNOTATION_KEY = "repair_plugin/state.json"
+ANNOTATION_KEY = "krita_repair_plugin/state.json"
+LEGACY_ANNOTATION_KEYS = ("repair_plugin/state.json",)
 SCHEMA_VERSION = 1
 
 
@@ -77,6 +78,11 @@ class RepairStateStore:
 
     def load(self) -> None:
         annotation = self.document.find_annotation(self.annotation_key)
+        if annotation is None:
+            for legacy_key in LEGACY_ANNOTATION_KEYS:
+                annotation = self.document.find_annotation(legacy_key)
+                if annotation is not None:
+                    break
         if annotation is None:
             self.data = RepairStateData()
             return
@@ -232,6 +238,76 @@ class RepairStateStore:
             }
         )
         return self.upsert_record(record)
+
+    def migrate_from_sync_records(self, records: list[Any]) -> bool:
+        """Migrate legacy repair_plugin_refine snapshots into RepairStateStore."""
+        changed = False
+
+        for sync_record in list(records or []):
+            layer_ids = [
+                str(layer_id or "")
+                for layer_id in list(getattr(sync_record, "layer_ids", []) or [])
+                if str(layer_id or "")
+            ]
+            if len(layer_ids) != 1:
+                continue
+
+            canonical_layer_id = layer_ids[0]
+            snapshot = dict(getattr(sync_record, "params_snapshot", {}) or {})
+            refine_state = snapshot.get("repair_plugin_refine", {})
+            if not isinstance(refine_state, dict) or not refine_state:
+                continue
+
+            active_layer_id = str(refine_state.get("current_layer_id", "") or "")
+            if not active_layer_id:
+                continue
+
+            record = self.resolve_by_canonical_layer_id(canonical_layer_id)
+            if record is None:
+                record = RepairStateRecord(canonical_layer_id=canonical_layer_id)
+
+            if record.active_layer_id:
+                continue
+
+            record.export_key = str(getattr(sync_record, "export_key", "") or record.export_key or "")
+            record.group_id = getattr(sync_record, "group_id", None) or record.group_id
+            record.group_name = getattr(sync_record, "group_name", None) or record.group_name
+            record.active_layer_id = active_layer_id
+            record.active_layer_name = str(refine_state.get("current_layer_name", "") or "")
+
+            previous_layer_id = str(refine_state.get("previous_layer_id", "") or "")
+            if previous_layer_id and previous_layer_id != active_layer_id:
+                record.replacements[previous_layer_id] = active_layer_id
+                if previous_layer_id not in record.deleted_layer_ids:
+                    record.deleted_layer_ids.append(previous_layer_id)
+
+            if canonical_layer_id != active_layer_id:
+                record.replacements[canonical_layer_id] = active_layer_id
+                if canonical_layer_id not in record.deleted_layer_ids:
+                    record.deleted_layer_ids.append(canonical_layer_id)
+
+            history = refine_state.get("history", [])
+            if isinstance(history, list):
+                for item in history:
+                    if not isinstance(item, dict):
+                        continue
+                    old_id = str(item.get("previous_layer_id", "") or "")
+                    new_id = str(item.get("refined_layer_id", "") or "")
+                    if old_id and new_id and old_id != new_id:
+                        record.replacements[old_id] = new_id
+                        if old_id not in record.deleted_layer_ids:
+                            record.deleted_layer_ids.append(old_id)
+                    record.refine_history.append(dict(item))
+
+            if not record.updated_at:
+                record.updated_at = utc_timestamp()
+
+            self.data.records_by_canonical_layer_id[canonical_layer_id] = record
+            changed = True
+
+        if changed:
+            self.save()
+        return changed
 
     def all_records(self) -> list[RepairStateRecord]:
         return list(self.data.records_by_canonical_layer_id.values())
