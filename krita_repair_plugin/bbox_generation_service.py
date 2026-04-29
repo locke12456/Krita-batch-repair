@@ -458,30 +458,20 @@ class BBoxGenerationService:
                 generation_extent=generation_extent,
                 original_extent=expected_extent,
             )
-            # --- Mask feather / grow / blend via KAD native API (method C) ---
-            from ai_diffusion.model import (
-                calc_selection_pre_process,
-                get_selection_modifiers,
-            )
+            # --- Mask feather / grow / blend via stable Method A defaults ---
+            # Keep the old bbox-local behavior: compute reasonable mask process
+            # parameters without switching to KAD's full native selection API.
+            _diag = (generation_extent.width ** 2 + generation_extent.height ** 2) ** 0.5
+            _feather = max(int(0.10 * _diag), 32)
+            _grow = 4 + _feather // 2
+            _blend = min(25, _grow + _feather // 2)
 
-            # Initial InpaintParams with zero grow/feather/blend
-            inpaint = InpaintParams(InpaintMode.fill, local_bounds)
-
-            # Get selection modifiers matching the current arch + strength
-            smod = get_selection_modifiers(
-                checkpoint.version,  # Arch
+            inpaint = InpaintParams(
                 InpaintMode.fill,
-                strength,
-            )
-
-            # Use generation_extent as bounds (semantic = bbox crop diagonal)
-            selection_bounds = Bounds(
-                0, 0, generation_extent.width, generation_extent.height
-            )
-
-            # Let KAD compute grow / feather / blend natively
-            inpaint = calc_selection_pre_process(
-                inpaint, selection_bounds, smod
+                local_bounds,
+                grow=_grow,
+                feather=_feather,
+                blend=_blend,
             )
 
             native_inpaint = getattr(model, "inpaint", None)
@@ -785,6 +775,18 @@ class BBoxGenerationService:
             y=bbox["y"],
         )
         self._move_layer_to_group_top(document_ref, created_layer, task.group_layer)
+
+        # Whole-crop refine means crop_bbox == detector_bbox. In that case the
+        # entire generated crop is the intended replacement target, so do not
+        # add an inward transparency mask. Adding one would incorrectly fade the
+        # full refine result at its edges.
+        if not self._is_whole_crop_refine_task(task):
+            self._attach_inward_blur_transparency_mask(
+                document_ref=document_ref,
+                layer_ref=created_layer,
+                bbox=bbox,
+                blur_px=24,
+            )
         result = RepairGenerationResult(
             task=task,
             success=True,
@@ -794,6 +796,82 @@ class BBoxGenerationService:
         )
         self._attach_generation_metadata(created_layer, result)
         return result
+
+    def _attach_inward_blur_transparency_mask(
+        self,
+        document_ref: Any,
+        layer_ref: Any,
+        bbox: dict[str, int],
+        blur_px: int = 24,
+    ) -> None:
+        """Attach a real Krita transparency mask child to the generated layer.
+
+        This must visibly create a child node like:
+            Generated layer
+                Transparency Mask 1
+
+        If the child mask cannot be verified, raise an error instead of silently
+        continuing with an opaque rectangle.
+        """
+        width = max(1, int(bbox.get("width", 0) or 0))
+        height = max(1, int(bbox.get("height", 0) or 0))
+        x0 = int(bbox.get("x", 0) or 0)
+        y0 = int(bbox.get("y", 0) or 0)
+        blur = max(1, min(int(blur_px), max(1, min(width, height) // 2)))
+
+        values: list[int] = []
+        for y in range(height):
+            for x in range(width):
+                dx = 0
+                if x < blur:
+                    dx = blur - x
+                elif x > width - blur - 1:
+                    dx = x - (width - blur - 1)
+
+                dy = 0
+                if y < blur:
+                    dy = blur - y
+                elif y > height - blur - 1:
+                    dy = y - (height - blur - 1)
+
+                d = float((dx * dx + dy * dy) ** 0.5)
+                alpha = 0 if d >= blur else int(255 * (1.0 - d / float(blur)))
+                values.append(max(0, min(255, alpha)))
+
+        document = getattr(document_ref, "document", None)
+        create_mask = getattr(document, "createTransparencyMask", None)
+        if not callable(create_mask):
+            raise RuntimeError("Krita document does not expose createTransparencyMask().")
+
+        layer_node = getattr(layer_ref, "node", layer_ref)
+        add_child = getattr(layer_node, "addChildNode", None)
+        child_nodes = getattr(layer_node, "childNodes", None)
+        if not callable(add_child) or not callable(child_nodes):
+            raise RuntimeError("Generated layer node cannot accept or report child mask nodes.")
+
+        mask_node = create_mask("Transparency Mask 1")
+        try:
+            mask_node.setName("Transparency Mask 1")
+        except Exception:
+            pass
+
+        set_pixel_data = getattr(mask_node, "setPixelData", None)
+        if not callable(set_pixel_data):
+            raise RuntimeError("Transparency mask node does not expose setPixelData().")
+
+        # Transparency mask coordinates are document-space, matching the generated
+        # layer pixel placement. The mask size itself never exceeds the generated image.
+        set_pixel_data(QtCore.QByteArray(bytes(values)), x0, y0, width, height)
+
+        add_child(mask_node, None)
+
+        children = list(child_nodes() or [])
+        mask_children = [child for child in children if str(getattr(child, "type", lambda: "")()).lower() == "transparencymask"]
+        if mask_node not in children and not mask_children:
+            raise RuntimeError("Transparency mask was created but is not attached under generated layer.")
+
+        if callable(getattr(document_ref, "refresh_projection", None)):
+            document_ref.refresh_projection()
 
     def validate_task(self, task: RepairGenerationTask) -> None:
         if task.group_layer is None:
@@ -858,7 +936,7 @@ class BBoxGenerationService:
                     "repair_plugin.generation_job_id": result.job_id,
                     "repair_plugin.generation_result_layer_id": result.created_layer_id,
                     "repair_plugin.generation_result_layer_name": result.created_layer_name,
-                    "repair_plugin.detector_bbox": task.bbox,
+                    "repair_plugin.detector_bbox": task.detector_bbox,
                     "repair_plugin.crop_bbox": task.bbox,
                     "repair_plugin.source_group_id": task.record.group_id,
                     "repair_plugin.source_group_name": task.record.group_name,
