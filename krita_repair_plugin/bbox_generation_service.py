@@ -458,21 +458,30 @@ class BBoxGenerationService:
                 generation_extent=generation_extent,
                 original_extent=expected_extent,
             )
-            # --- Mask feather / grow / blend (match KAD native pipeline) ---
-            # Mirrors model.calc_selection_pre_process() using settings defaults.
-            # settings is already imported in this try block.
-            _diag = (generation_extent.width ** 2 + generation_extent.height ** 2) ** 0.5
-            _feather_rel = (settings.selection_feather / 100.0) * strength
-            _feather = max(int(_feather_rel * _diag), settings.selection_min_transition)
-            _grow = settings.selection_grow_offset + _feather // 2
-            _blend = min(settings.selection_blend, _grow + _feather // 2)
+            # --- Mask feather / grow / blend via KAD native API (method C) ---
+            from ai_diffusion.model import (
+                calc_selection_pre_process,
+                get_selection_modifiers,
+            )
 
-            inpaint = InpaintParams(
+            # Initial InpaintParams with zero grow/feather/blend
+            inpaint = InpaintParams(InpaintMode.fill, local_bounds)
+
+            # Get selection modifiers matching the current arch + strength
+            smod = get_selection_modifiers(
+                checkpoint.version,  # Arch
                 InpaintMode.fill,
-                local_bounds,
-                grow=_grow,
-                feather=_feather,
-                blend=_blend,
+                strength,
+            )
+
+            # Use generation_extent as bounds (semantic = bbox crop diagonal)
+            selection_bounds = Bounds(
+                0, 0, generation_extent.width, generation_extent.height
+            )
+
+            # Let KAD compute grow / feather / blend natively
+            inpaint = calc_selection_pre_process(
+                inpaint, selection_bounds, smod
             )
 
             native_inpaint = getattr(model, "inpaint", None)

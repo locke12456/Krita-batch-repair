@@ -68,6 +68,13 @@ def expand_bbox_to_forced_rect(
     bbox_height = max(1, height)
     actual_width = max(int(target_width), bbox_width)
     actual_height = max(int(target_height), bbox_height)
+
+    # Clamp target to image dimensions so the sequential shift-then-truncate
+    # logic below never produces a rect smaller than intended (fix: black frame).
+    if clamp_to_bounds:
+        actual_width = min(actual_width, int(image_width))
+        actual_height = min(actual_height, int(image_height))
+
     center_x = x + bbox_width // 2
     center_y = y + bbox_height // 2
 

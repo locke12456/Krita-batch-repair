@@ -15,6 +15,7 @@ from .layer_metadata_service import LayerMetadataService
 from .prompt_extraction_service import PromptExtractionService
 from .prompt_extraction_worker import PromptExtractionProgress, PromptExtractionWorker
 from .repair_result_model import RepairResultSelectionModel, RepairResultRow
+from .repair_state_store import RepairStateRecord, RepairStateStore
 from .repair_compat import (
     QCheckBox,
     QComboBox,
@@ -24,6 +25,8 @@ from .repair_compat import (
     QMessageBox,
     QPushButton,
     QScrollArea,
+    active_krita_document,
+    all_krita_nodes,
     delete_layer,
     find_krita_node_by_id,
     merge_layer_into_target,
@@ -70,6 +73,7 @@ class RepairDocker(DockWidget):
         self.group_selection_model = GroupSelectionModel()
         self.result_selection_model = RepairResultSelectionModel()
         self.metadata_service = LayerMetadataService()
+        self.repair_state_store: RepairStateStore | None = None
         self.prompt_worker: PromptExtractionWorker | None = None
         self.prompt_extraction_service = PromptExtractionService(
             metadata_service=self.metadata_service,
@@ -87,6 +91,7 @@ class RepairDocker(DockWidget):
         self.group_refine_service = GroupRefineService(
             bbox_generation_service=self.bbox_generation_service,
             metadata_service=self.metadata_service,
+            repair_state_store=self.repair_state_store,
         )
 
         self._log_docker = RepairLogDocker()
@@ -100,6 +105,7 @@ class RepairDocker(DockWidget):
         self._unload_button = QPushButton("Unload Detector")
         self._detect_button = QPushButton("Batch Detect Selected Groups")
         self._refine_groups_button = QPushButton("Refine Selected Groups")
+        self._sync_all_button = QPushButton("Sync All")
         self._image2tagger_checkbox = QCheckBox("Use image2tagger prompt")
         self._image2tagger_threshold_input = QLineEdit("0.8")
         self._generation_checkbox = QCheckBox("Generate bbox repair")
@@ -195,7 +201,10 @@ class RepairDocker(DockWidget):
         rect_row.addWidget(self._clamp_rect_checkbox)
         layout.addLayout(rect_row)
 
-        layout.addWidget(self._refine_groups_button)
+        refine_sync_row = QHBoxLayout()
+        refine_sync_row.addWidget(self._refine_groups_button)
+        refine_sync_row.addWidget(self._sync_all_button)
+        layout.addLayout(refine_sync_row)
         layout.addWidget(self._detect_button)
         layout.addWidget(self._status_label)
 
@@ -250,6 +259,7 @@ class RepairDocker(DockWidget):
         )
         self._detect_button.clicked.connect(self._batch_detect_selected_groups)
         self._refine_groups_button.clicked.connect(self._refine_selected_groups)
+        self._sync_all_button.clicked.connect(self._sync_all_refined_groups)
         self._select_all_button.clicked.connect(self._select_all_groups)
         self._clear_selected_button.clicked.connect(self._clear_groups)
         self._select_all_results_button.clicked.connect(self._select_all_results)
@@ -288,10 +298,21 @@ class RepairDocker(DockWidget):
             clamp_rect_to_source_bounds=self._clamp_rect_checkbox.isChecked(),
         )
 
+    def _current_repair_state_store(self) -> RepairStateStore:
+        """Return a RepairStateStore for the active Krita document."""
+        document_ref = active_krita_document()
+        if document_ref is None:
+            raise RuntimeError("No active Krita document.")
+        if self.repair_state_store is None:
+            self.repair_state_store = RepairStateStore(document_ref)
+        return self.repair_state_store
+
     def _refresh_groups(self) -> None:
         """Load group-backed SyncRecord rows from the active document."""
         try:
-            rows = GroupSyncSource().load_rows()
+            rows = GroupSyncSource(
+                repair_state_store=self._current_repair_state_store(),
+            ).load_rows()
             self.group_selection_model.replace_rows(rows)
             self._refresh_group_rows()
             if not rows:
@@ -398,9 +419,16 @@ class RepairDocker(DockWidget):
             + (f" | {warnings}" if warnings else "")
         )
 
+        sync_button = QPushButton("Sync")
+        sync_button.setEnabled(row.is_resolved)
+        sync_button.clicked.connect(
+            lambda _checked=False, target=row: self._sync_group_row(target)
+        )
+
         row_layout.addWidget(selected)
         row_layout.addWidget(active)
         row_layout.addWidget(label)
+        row_layout.addWidget(sync_button)
         return row_widget
 
     def _set_group_selected(self, row: RepairGroupRow, selected: bool) -> None:
@@ -958,6 +986,7 @@ class RepairDocker(DockWidget):
                     f"Reasons: {', '.join(reasons)}"
                 )
                 return
+            self.group_refine_service.repair_state_store = self._current_repair_state_store()
             reports = self.group_refine_service.refine_rows(eligible)
             self._refresh_group_rows()
             success = sum(1 for r in reports if r.get("status") == "success")
@@ -969,6 +998,103 @@ class RepairDocker(DockWidget):
             )
         except Exception as exc:
             self._show_error(str(exc))
+
+    def _sync_group_row(self, row: RepairGroupRow) -> bool:
+        """Sync one group row active source into RepairStateStore."""
+        try:
+            if not row.is_resolved or row.group_layer is None:
+                self._show_info("Group is not resolved; cannot sync.")
+                return False
+            if len(row.source_layers) != 1:
+                self._show_info("Group must have exactly one resolved active source layer to sync.")
+                return False
+
+            canonical_layer_ids = [
+                str(layer_id or "")
+                for layer_id in list(getattr(row.record, "layer_ids", []) or [])
+                if str(layer_id or "")
+            ]
+            if len(canonical_layer_ids) != 1:
+                self._show_info("SyncRecord.layer_ids must contain exactly one canonical layer id.")
+                return False
+
+            canonical_layer_id = canonical_layer_ids[0]
+            active_layer = row.source_layers[0]
+            active_layer_id = str(getattr(active_layer, "id_string", "") or "")
+            if not active_layer_id:
+                self._show_info("Active source layer id could not be resolved.")
+                return False
+
+            store = self._current_repair_state_store()
+            record = store.resolve_by_canonical_layer_id(canonical_layer_id)
+            if record is None:
+                record = RepairStateRecord(canonical_layer_id=canonical_layer_id)
+
+            record.export_key = str(getattr(row.record, "export_key", "") or record.export_key or "")
+            record.group_id = getattr(row.record, "group_id", None) or record.group_id
+            record.group_name = getattr(row.record, "group_name", None) or record.group_name
+            record.active_layer_id = active_layer_id
+            record.active_layer_name = str(getattr(active_layer, "name", "") or "")
+
+            if canonical_layer_id != active_layer_id:
+                record.replacements[canonical_layer_id] = active_layer_id
+                if canonical_layer_id not in record.deleted_layer_ids:
+                    record.deleted_layer_ids.append(canonical_layer_id)
+
+            store.upsert_record(record)
+
+            self._log_docker.append_log(
+                f"Synced group {row.display_name}: active repair layer state updated"
+            )
+            self._refresh_group_rows()
+            return True
+        except Exception as exc:
+            self._show_error(f"Sync failed for {row.display_name}: {exc}")
+            return False
+
+    def _sync_all_refined_groups(self) -> None:
+        """Sync all selected resolved groups (persist current layer_ids)."""
+        try:
+            rows = self.group_selection_model.selected_active_groups()
+            if not rows:
+                self._show_info("No selected resolved groups are available.")
+                return
+
+            success = 0
+            failed = 0
+            for row in rows:
+                try:
+                    if self._sync_group_row(row):
+                        success += 1
+                    else:
+                        failed += 1
+                except Exception:
+                    failed += 1
+
+            self._log_docker.set_report(
+                f"Sync All Report: success={success}, failed={failed}, "
+                f"total={len(rows)}"
+            )
+        except Exception as exc:
+            self._show_error(str(exc))
+
+    def _is_group_node_check(self, layer: Any) -> bool:
+        """Check if a layer is a group node (for sync filtering)."""
+        from .repair_compat import is_group_layer
+        try:
+            if is_group_layer(layer):
+                return True
+        except Exception:
+            pass
+        node = getattr(layer, "node", layer)
+        layer_type = str(getattr(layer, "type", "") or "").lower()
+        node_type = getattr(node, "type", None)
+        if callable(node_type):
+            try:
+                layer_type = str(node_type() or "").lower()
+            except Exception:
+                pass
+        return layer_type in {"grouplayer", "group_layer", "group"}
 
     def _show_info(self, message: str) -> None:
         """Display an informational message."""

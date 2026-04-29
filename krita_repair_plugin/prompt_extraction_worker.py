@@ -69,11 +69,24 @@ class PromptExtractionWorker:
     async def run_async(self) -> list[PromptExtractionResult]:
         results: list[PromptExtractionResult] = []
         total = len(self.rows)
+        cache_key = f"tag[{self.threshold}]" if self.threshold is not None else "tag[0.8]"
 
         for index, row in enumerate(self.rows, start=1):
             if self.cancelled:
                 row.mark_prompt_cancelled(index=index, total=total)
                 self._emit_progress(index - 1, total, row, cancelled=True)
+                self._emit_row_finished(row, None)
+                continue
+
+            # --- Group-level tagger cache check ---
+            cached_prompt = self._get_group_tagger_cache(row, cache_key)
+            if cached_prompt is not None:
+                row.mark_prompt_done(
+                    prompt_text=cached_prompt,
+                    index=index,
+                    total=total,
+                )
+                self._emit_progress(index, total, row)
                 self._emit_row_finished(row, None)
                 continue
 
@@ -101,6 +114,8 @@ class PromptExtractionWorker:
                     index=index,
                     total=total,
                 )
+                # --- Save to group-level tagger cache & persist ---
+                self._set_group_tagger_cache(row, cache_key, result.prompt_text)
             else:
                 row.mark_prompt_failed(
                     error=result.error_message,
@@ -152,3 +167,49 @@ class PromptExtractionWorker:
         callback = self.on_completed
         if callable(callback):
             callback(progress)
+
+    # ---- Group-level tagger cache (tag[threshold]) ----
+
+    def _get_group_tagger_cache(
+        self, row: RepairResultRow, cache_key: str,
+    ) -> str | None:
+        """Check group record.params_snapshot for cached tagger prompt."""
+        record = row.record
+        if record is None:
+            return None
+        snapshot = getattr(record, "params_snapshot", None) or {}
+        cached = snapshot.get(cache_key)
+        if cached and isinstance(cached, str):
+            return cached
+        return None
+
+    def _set_group_tagger_cache(
+        self, row: RepairResultRow, cache_key: str, prompt_text: str,
+    ) -> None:
+        """Save only the tagger prompt cache namespace to SyncMapStore."""
+        record = row.record
+        if record is None:
+            return
+
+        snapshot = dict(getattr(record, "params_snapshot", None) or {})
+        snapshot[cache_key] = str(prompt_text or "")
+        record.params_snapshot = snapshot
+
+        try:
+            document_ref = getattr(row.source_layer, "document_ref", None)
+            if document_ref is None:
+                document_ref = getattr(row.group_layer, "document_ref", None)
+            if document_ref is None:
+                from .repair_compat import active_krita_document
+                document_ref = active_krita_document()
+            if document_ref is None:
+                return
+
+            from krita_ai_metadata.sync_map_store import SyncMapStore
+            store = SyncMapStore(document_ref)
+            store.record_apply(record)
+        except Exception as exc:
+            print(
+                f"[PromptWorker] WARNING: failed to persist tagger cache "
+                f"for key={cache_key}: {exc}"
+            )

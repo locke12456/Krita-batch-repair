@@ -11,6 +11,7 @@ from .bbox_generation_service import (
 )
 from .group_selection_model import RepairGroupRow
 from .repair_compat import find_krita_node_by_id, render_node_projection
+from .repair_state_store import RepairStateStore
 
 
 @dataclass(slots=True)
@@ -55,10 +56,12 @@ class RefineRowProxy:
         group_row: RepairGroupRow,
         source_layer: Any,
         document_ref: Any,
+        repair_state_store: RepairStateStore | None = None,
     ) -> None:
         self.group_row = group_row
         self.source_layer = source_layer
         self.document_ref = document_ref
+        self.repair_state_store = repair_state_store
         self.generation_status: str = "not_started"
         self.generation_job_id: str = ""
         self.generation_result_layer_id: str = ""
@@ -89,7 +92,7 @@ class RefineRowProxy:
         self.generation_error = str(error or "")
 
     def _replace_source_layer(self, layer_id: str) -> None:
-        """Replace the original source layer in group_row.source_layers."""
+        """Replace the original source layer in group_row.source_layers and persist."""
         if not layer_id or self.document_ref is None:
             return
         created_layer = find_krita_node_by_id(self.document_ref, layer_id)
@@ -99,15 +102,59 @@ class RefineRowProxy:
                 f"id={layer_id}; source_layers not replaced."
             )
             return
+
+        # 1. In-memory replacement
         source_layers = self.group_row.source_layers
+        old_id = getattr(self.source_layer, "id_string", None)
+        replaced = False
         for i, existing in enumerate(source_layers):
             if existing is self.source_layer:
                 source_layers[i] = created_layer
-                return
-        print(
-            "[RefineRowProxy] WARNING: original source_layer not found in "
-            "group_row.source_layers (may have been refreshed); skipping replacement."
-        )
+                replaced = True
+                break
+        if not replaced:
+            print(
+                "[RefineRowProxy] WARNING: original source_layer not found in "
+                "group_row.source_layers (may have been refreshed); skipping replacement."
+            )
+
+        record = self.group_row.record
+        canonical_layer_id = ""
+        layer_ids = list(getattr(record, "layer_ids", []) or [])
+        if len(layer_ids) == 1:
+            canonical_layer_id = str(layer_ids[0] or "")
+
+        if old_id and layer_id and canonical_layer_id and self.repair_state_store is not None:
+            self.repair_state_store.record_refine_success(
+                canonical_layer_id=canonical_layer_id,
+                old_layer_id=str(old_id),
+                new_layer_id=str(layer_id),
+                export_key=str(getattr(record, "export_key", "") or ""),
+                group_id=getattr(record, "group_id", None),
+                group_name=getattr(record, "group_name", None),
+                active_layer_name=str(getattr(created_layer, "name", "") or ""),
+                job_id=str(self.generation_job_id or ""),
+                seed=getattr(record, "seed", None),
+            )
+        elif old_id and layer_id:
+            print(
+                "[RefineRowProxy] WARNING: repair state was not persisted; "
+                "old source layer will not be deleted."
+            )
+            return
+
+        # Delete old source layer only after RepairStateStore persistence succeeds.
+        if old_id and replaced:
+            try:
+                from .repair_compat import delete_layer as _del_old
+                old_node = find_krita_node_by_id(self.document_ref, old_id)
+                if old_node is not None:
+                    _del_old(old_node)
+            except Exception as exc:
+                print(
+                    f"[RefineRowProxy] WARNING: failed to delete old source "
+                    f"layer id={old_id}: {exc}"
+                )
 
 
 class GroupRefineService:
@@ -123,10 +170,12 @@ class GroupRefineService:
         bbox_generation_service: BBoxGenerationService,
         metadata_service: Any | None = None,
         on_row_finished: Callable[[RepairGroupRow, GroupRefineReport], None] | None = None,
+        repair_state_store: RepairStateStore | None = None,
     ) -> None:
         self.bbox_generation_service = bbox_generation_service
         self.metadata_service = metadata_service
         self.on_row_finished = on_row_finished
+        self.repair_state_store = repair_state_store
 
     def refine_rows(self, rows: list[RepairGroupRow]) -> list[dict[str, Any]]:
         """Refine eligible group rows and return per-row report dicts."""
@@ -217,6 +266,7 @@ class GroupRefineService:
                 group_row=row,
                 source_layer=source_layer,
                 document_ref=document_ref,
+                repair_state_store=self.repair_state_store,
             )
             result = self.bbox_generation_service.enqueue_task(task, row=proxy)
             return GroupRefineReport(
