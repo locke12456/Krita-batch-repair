@@ -113,7 +113,7 @@ class RepairDocker(DockWidget):
         self._select_all_results_button = QPushButton("Select All Results")
         self._clear_results_button = QPushButton("Clear Results")
         self._generate_results_button = QPushButton("Generate Selected Results")
-        self._batch_merge_button = QPushButton("Batch Merge Selected Results")
+        self._batch_merge_button = QPushButton("Batch Remove Selected Results")
         self._result_filter_checkbox = QCheckBox("filter")
         self._result_filter_prompt_combo = QComboBox()
         self._result_visible_checkbox = QCheckBox("visible")
@@ -257,7 +257,7 @@ class RepairDocker(DockWidget):
         self._extract_tags_button.clicked.connect(self._extract_tags_for_selected_results)
         self._cancel_tags_button.clicked.connect(self._cancel_tag_extraction)
         self._generate_results_button.clicked.connect(self._generate_selected_results)
-        self._batch_merge_button.clicked.connect(self._batch_merge_selected_results)
+        self._batch_merge_button.clicked.connect(self._batch_remove_selected_results)
         self._result_visible_checkbox.stateChanged.connect(
             lambda _state: self._set_toolbar_visibility_exclusive("visible")
         )
@@ -726,26 +726,36 @@ class RepairDocker(DockWidget):
             self._show_error(row.merge_error)
         self._refresh_result_rows()
 
-    def _batch_merge_selected_results(self) -> None:
-        """Batch merge all eligible selected result rows."""
+    def _batch_remove_selected_results(self) -> None:
+        """Batch remove all eligible selected result rows (delete layers + remove from model)."""
         rows = self.result_selection_model.selected_active_results()
         eligible = [
             row for row in rows
-            if row.generation_status == "done" and row.merge_status != "merged"
+            if row.generation_status == "done"
         ]
-        # Sort by generation order so merge applies in the same sequence as generation
-        eligible.sort(key=lambda r: r.generation_order if r.generation_order >= 0 else float('inf'))
         if not eligible:
-            self._show_info("No selected results are eligible for batch merge.")
+            self._show_info("No selected results have completed generation for cleanup.")
             return
 
+        success_count = 0
+        failed_count = 0
         for row in eligible:
-            self._merge_result_generation_layer(row)
+            try:
+                # Delete detection/crop cache layer, keep generated repair layer
+                if row.created_layer is not None and row.created_layer is not row.source_layer:
+                    try:
+                        delete_layer(row.created_layer)
+                    except Exception:
+                        pass  # Already removed or stale
+                self.result_selection_model.remove_result(row.result_id)
+                success_count += 1
+            except Exception as exc:
+                failed_count += 1
+                print(f"[RepairDocker] WARNING: batch remove failed for {row.display_name}: {exc}")
 
-        success_count = sum(1 for r in eligible if r.merge_status == "merged")
-        failed_count = sum(1 for r in eligible if r.merge_status == "failed")
+        self._refresh_result_rows()
         self._log_docker.set_report(
-            f"Batch Merge Report: success={success_count}, "
+            f"Batch Remove Report: success={success_count}, "
             f"failed={failed_count}, total={len(eligible)}"
         )
 
