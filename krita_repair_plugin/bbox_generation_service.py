@@ -775,18 +775,12 @@ class BBoxGenerationService:
             y=bbox["y"],
         )
         self._move_layer_to_group_top(document_ref, created_layer, task.group_layer)
-
-        # Whole-crop refine means crop_bbox == detector_bbox. In that case the
-        # entire generated crop is the intended replacement target, so do not
-        # add an inward transparency mask. Adding one would incorrectly fade the
-        # full refine result at its edges.
-        if not self._is_whole_crop_refine_task(task):
-            self._attach_inward_blur_transparency_mask(
-                document_ref=document_ref,
-                layer_ref=created_layer,
-                bbox=bbox,
-                blur_px=24,
-            )
+        self._attach_inward_blur_transparency_mask(
+            document_ref=document_ref,
+            layer_ref=created_layer,
+            bbox=bbox,
+            blur_px=24,
+        )
         result = RepairGenerationResult(
             task=task,
             success=True,
