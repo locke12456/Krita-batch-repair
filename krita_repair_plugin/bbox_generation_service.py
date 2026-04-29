@@ -18,9 +18,9 @@ class RepairGenerationTask:
     detector_bbox: dict[str, int]
     crop_png_bytes: bytes
     prompt_text: str
-    prompt_type_prompt: str = ""
-    detector_mode: str = ""
+    detector_mode: str
     detector_label: str
+    prompt_type_prompt: str = ""
     base_positive: str = ""
     user_positive: str = ""
     base_negative: str = ""
@@ -65,8 +65,12 @@ class BBoxGenerationService:
         user_negative: str = "",
     ) -> tuple[str, str]:
         """Insert bbox prompt before user/base positive prompt and preserve negative prompt."""
+        prompt_type_prompt = (
+            str(getattr(result_row, "prompt_type_prompt", "") or "").strip()
+            or self._prompt_type_prompt_for_row(result_row)
+        )
         positive_parts = [
-            str(getattr(result_row, "prompt_type_prompt", "") or "").strip(),
+            prompt_type_prompt,
             str(getattr(result_row, "prompt_text", "") or "").strip(),
             str(user_positive or "").strip(),
             str(base_positive or "").strip(),
@@ -78,6 +82,29 @@ class BBoxGenerationService:
         positive = ", ".join(part for part in positive_parts if part)
         negative = ", ".join(part for part in negative_parts if part)
         return positive, negative
+
+    def _prompt_type_prompt_for_row(self, result_row: Any) -> str:
+        """Return a default prompt fragment from the effective detector row type."""
+        effective_type = getattr(result_row, "effective_prompt_type", None)
+        if callable(effective_type):
+            prompt_type = effective_type()
+        else:
+            prompt_type = (
+                str(getattr(result_row, "detector_label", "") or "")
+                or str(getattr(result_row, "detector_mode", "") or "")
+            )
+        lowered = str(prompt_type or "").strip().lower()
+        if "head" in lowered or "face" in lowered:
+            return "detailed head repair, natural face structure"
+        if "penis" in lowered:
+            return "anatomically consistent penis repair"
+        if "pussy" in lowered or "vagina" in lowered:
+            return "anatomically consistent pussy repair"
+        if "censor" in lowered or "mosaic" in lowered:
+            return "remove censorship artifact, restore natural detail"
+        if lowered and lowered != "all":
+            return "localized repair, coherent texture and lighting"
+        return ""
 
     def task_from_result_row(
         self,
@@ -102,7 +129,10 @@ class BBoxGenerationService:
             detector_bbox=dict(getattr(row, "detector_bbox", {}) or {}),
             crop_png_bytes=bytes(row.crop_png_bytes),
             prompt_text=positive,
-            prompt_type_prompt=str(getattr(row, "prompt_type_prompt", "") or ""),
+            prompt_type_prompt=(
+                str(getattr(row, "prompt_type_prompt", "") or "").strip()
+                or self._prompt_type_prompt_for_row(row)
+            ),
             detector_mode=str(row.detector_mode),
             detector_label=str(row.detector_label),
             base_positive=base_positive,

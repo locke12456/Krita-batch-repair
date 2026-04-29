@@ -35,7 +35,9 @@ add_layer_only_paint_layer = krita_core_adapter.add_layer_only_paint_layer
 all_krita_nodes = krita_core_adapter.all_krita_nodes
 find_krita_node_by_id = krita_core_adapter.find_krita_node_by_id
 merge_layer_down = krita_core_adapter.merge_layer_down
+merge_layer_into_target = krita_core_adapter.merge_layer_into_target
 move_layer_above = krita_core_adapter.move_layer_above
+move_layer_immediately_above = krita_core_adapter.move_layer_immediately_above
 render_node_projection = krita_core_adapter.render_node_projection
 set_layer_visible = krita_core_adapter.set_layer_visible
 selected_krita_nodes = krita_core_adapter.selected_krita_nodes
@@ -173,7 +175,9 @@ __all__ = [
     "is_image_layer",
     "make_bounds",
     "merge_layer_down",
+    "merge_layer_into_target",
     "move_layer_above",
+    "move_layer_immediately_above",
     "refresh_ai_projection",
     "render_node_projection",
     "set_layer_visible",

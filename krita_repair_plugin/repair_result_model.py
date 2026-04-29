@@ -45,6 +45,24 @@ def _bbox_copy(value: dict[str, int] | None) -> dict[str, int]:
     return {str(key): int(raw) for key, raw in value.items()}
 
 
+def _normalized_prompt_type(value: str) -> str:
+    raw = str(value or "").strip()
+    lowered = raw.lower()
+    if not lowered or lowered == "all":
+        return ""
+    if "head" in lowered or "face" in lowered:
+        return "Head"
+    if "penis" in lowered:
+        return "Penis"
+    if "pussy" in lowered or "vagina" in lowered:
+        return "Pussy"
+    if "censor" in lowered or "mosaic" in lowered:
+        return "Censor"
+    if "other" in lowered:
+        return "Other"
+    return raw[:1].upper() + raw[1:]
+
+
 @dataclass(slots=True)
 class RepairResultRow:
     result_id: str = field(default_factory=lambda: uuid4().hex)
@@ -131,6 +149,19 @@ class RepairResultRow:
             height = int(bbox.get("height", max(0, int(bbox.get("y2", 0)) - y)))
             return f"{group} | {source} | {x},{y} {width}x{height}"
         return f"{group} | {source}"
+
+    def detector_prompt_type(self) -> str:
+        """Return the detector-derived prompt type for this row."""
+        return (
+            _normalized_prompt_type(self.detector_label)
+            or _normalized_prompt_type(self.detector_mode)
+        )
+
+    def effective_prompt_type(self) -> str:
+        """Return the row type used by filtering and default prompt generation."""
+        if self.prompt_type_applied and self.prompt_type:
+            return _normalized_prompt_type(self.prompt_type)
+        return self.detector_prompt_type()
 
     def mark_prompt_queued(self, index: int = 0, total: int = 0) -> None:
         self.prompt_status = PROMPT_QUEUED
@@ -251,13 +282,13 @@ class RepairResultSelectionModel:
         return [row for row in self.rows if not row.removed]
 
     def rows_for_prompt_type(self, prompt_type: str) -> list[RepairResultRow]:
-        prompt_type = str(prompt_type or "").strip()
-        if not prompt_type or prompt_type.lower() == "all":
+        prompt_type = _normalized_prompt_type(prompt_type)
+        if not prompt_type:
             return self.non_removed_rows()
         return [
             row
             for row in self.non_removed_rows()
-            if row.prompt_type_applied and row.prompt_type == prompt_type
+            if row.effective_prompt_type() == prompt_type
         ]
 
     def visibility_target_rows(

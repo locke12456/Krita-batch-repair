@@ -24,8 +24,7 @@ from .repair_compat import (
     QPushButton,
     QScrollArea,
     find_krita_node_by_id,
-    merge_layer_down,
-    move_layer_above,
+    merge_layer_into_target,
     QVBoxLayout,
     QWidget,
     set_layer_visible,
@@ -435,19 +434,7 @@ class RepairDocker(DockWidget):
         )
 
         label = QLabel(self._result_row_label(row))
-
-        prompt_combo = QComboBox()
-        for prompt_type, _fragment in PROMPT_TYPE_OPTIONS:
-            prompt_combo.addItem(prompt_type)
-        self._set_combo_text(prompt_combo, row.prompt_type or "All")
-
-        apply_button = QPushButton("Apply")
-        apply_button.clicked.connect(
-            lambda _checked=False, target=row, combo=prompt_combo: self._apply_result_prompt_type(
-                target,
-                combo.currentText(),
-            )
-        )
+        tag_label = QLabel(f"Tag: {row.effective_prompt_type() or 'Unclassified'}")
 
         merge_button = QPushButton("Merge")
         merge_button.setEnabled(bool(row.generation_result_layer_id))
@@ -464,8 +451,7 @@ class RepairDocker(DockWidget):
         row_layout.addWidget(visible)
         row_layout.addWidget(active)
         row_layout.addWidget(label)
-        row_layout.addWidget(prompt_combo)
-        row_layout.addWidget(apply_button)
+        row_layout.addWidget(tag_label)
         row_layout.addWidget(merge_button)
         row_layout.addWidget(delete_button)
         return row_widget
@@ -575,28 +561,35 @@ class RepairDocker(DockWidget):
         self._refresh_result_rows()
 
     def _merge_result_generation_layer(self, row: RepairResultRow) -> None:
-        """Move the generated layer above source and merge it down."""
+        """Merge the generated layer into the correct row-specific target layer."""
         try:
             if not row.generation_result_layer_id:
                 raise RuntimeError("No generated layer to merge.")
+            if row.source_layer is None:
+                raise RuntimeError("Source layer is required for merge.")
             document_ref = getattr(row.source_layer, "document_ref", None)
             if document_ref is None:
                 raise RuntimeError("Source layer document_ref is required for merge.")
+
             generated = find_krita_node_by_id(document_ref, row.generation_result_layer_id)
             if generated is None:
                 raise RuntimeError("Generated layer could not be resolved.")
-            if row.source_layer is None:
-                raise RuntimeError("Source layer is required for merge.")
+
+            # Correct merge target is the row-specific repair/detection target layer.
+            # Fall back to the original source layer only when no created row layer exists.
+            target_layer = row.created_layer or row.source_layer
+            if target_layer is None:
+                raise RuntimeError("No row-specific target layer exists for merge.")
+
             group_node = getattr(row.group_layer, "node", row.group_layer)
-            source_node = getattr(row.source_layer, "node", row.source_layer)
             generated_node = getattr(generated, "node", generated)
+            target_node = getattr(target_layer, "node", target_layer)
             if group_node is None:
                 raise RuntimeError("Group layer is required for merge.")
-            if generated_node.parentNode() != group_node or source_node.parentNode() != group_node:
-                raise RuntimeError("Generated and source layers must share the result group parent.")
+            if generated_node.parentNode() != group_node or target_node.parentNode() != group_node:
+                raise RuntimeError("Generated and target layers must share the result group parent.")
 
-            moved = move_layer_above(document_ref, generated, row.source_layer)
-            merged = merge_layer_down(moved)
+            merged = merge_layer_into_target(document_ref, generated, target_layer)
             row.merge_status = "merged"
             row.merge_error = ""
             if merged is not None:
@@ -612,7 +605,7 @@ class RepairDocker(DockWidget):
 
     def _result_row_label(self, row: RepairResultRow) -> str:
         """Return compact row text so action widgets have horizontal room."""
-        prompt = row.prompt_type if row.prompt_type_applied else "unclassified"
+        prompt = row.effective_prompt_type() or "unclassified"
         merge = getattr(row, "merge_status", "not_started")
         return (
             f"{row.display_name} | type={prompt} | tag={row.prompt_status} | "
