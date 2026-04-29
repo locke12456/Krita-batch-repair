@@ -23,6 +23,7 @@ from .repair_compat import (
     QMessageBox,
     QPushButton,
     QScrollArea,
+    delete_layer,
     find_krita_node_by_id,
     merge_layer_into_target,
     QVBoxLayout,
@@ -551,14 +552,91 @@ class RepairDocker(DockWidget):
         return None
 
     def _delete_result_row(self, row: RepairResultRow) -> None:
-        """Safely remove a result row from the Docker model without deleting layers."""
+        """Delete this row's Krita layers, then remove the row from the model."""
         if row.generation_status == "running":
-            self._show_info("Cannot remove a result row while generation is running.")
+            self._show_info("Cannot delete a result row while generation is running.")
             return
-        removed = self.result_selection_model.remove_result(row.result_id)
-        if removed is not None:
-            self._attach_row_ui_metadata(removed, "result")
+
+        try:
+            for target in self._delete_targets_for_result_row(row):
+                delete_layer(target)
+            self.result_selection_model.remove_result(row.result_id)
+        except Exception as exc:
+            self._show_error(str(exc))
         self._refresh_result_rows()
+
+    def _delete_targets_for_result_row(self, row: RepairResultRow) -> list[Any]:
+        """Return unique layer targets owned by this result row.
+
+        Priority:
+        1. merged layer, when merge already produced a target id
+        2. generated repair layer
+        3. detection / repair row layer
+
+        Targets are deduplicated by Krita node id so merged rows do not try to
+        delete the same layer twice.
+        """
+        targets: list[Any] = []
+        seen_ids: set[str] = set()
+
+        def add_target(layer: Any | None) -> None:
+            if layer is None:
+                return
+            node = getattr(layer, "node", layer)
+            parent_node = getattr(node, "parentNode", None)
+            if not callable(parent_node) or parent_node() is None:
+                # Skip stale wrappers after mergeDown(); they no longer belong
+                # to the document tree and cannot be deleted safely.
+                return
+
+            layer_id = str(getattr(layer, "id_string", "") or "")
+            if not layer_id:
+                unique_id = getattr(node, "uniqueId", None)
+                if callable(unique_id):
+                    layer_id = str(unique_id().toString())
+            if layer_id and layer_id in seen_ids:
+                return
+            if layer_id:
+                seen_ids.add(layer_id)
+            targets.append(layer)
+
+        document_ref = getattr(row.source_layer, "document_ref", None)
+        is_merged = getattr(row, "merge_status", "") == "merged"
+
+        merged_layer_id = str(getattr(row, "merged_layer_id", "") or "")
+        if merged_layer_id and document_ref is not None:
+            add_target(find_krita_node_by_id(document_ref, merged_layer_id))
+
+        if is_merged and not targets:
+            # Backward-compatible fallback for rows merged before the live-id fix:
+            # the saved id may be stale, but the layer name is often still exact.
+            group_node = getattr(row.group_layer, "node", row.group_layer)
+            target_names = {
+                str(getattr(row, "merged_layer_name", "") or ""),
+                str(getattr(row, "display_name", "") or ""),
+            }
+            target_names.discard("")
+            try:
+                children = list(group_node.childNodes() or [])
+            except Exception:
+                children = []
+            for child in children:
+                child_name = str(getattr(child, "name", lambda: "")() or "")
+                if child_name in target_names:
+                    add_target(child)
+                    if targets:
+                        break
+
+        if not is_merged:
+            generated_layer_id = str(getattr(row, "generation_result_layer_id", "") or "")
+            if generated_layer_id and document_ref is not None:
+                add_target(find_krita_node_by_id(document_ref, generated_layer_id))
+
+        add_target(row.created_layer)
+
+        if not targets:
+            raise RuntimeError("No live Krita layer target exists for this result row.")
+        return targets
 
     def _merge_result_generation_layer(self, row: RepairResultRow) -> None:
         """Merge the generated layer into the correct row-specific target layer."""
@@ -590,11 +668,20 @@ class RepairDocker(DockWidget):
                 raise RuntimeError("Generated and target layers must share the result group parent.")
 
             merged = merge_layer_into_target(document_ref, generated, target_layer)
+            merged_layer_id = str(getattr(merged, "id_string", "") or "")
+            if not merged_layer_id:
+                raise RuntimeError("Merged layer id could not be resolved after merge.")
+
             row.merge_status = "merged"
             row.merge_error = ""
-            if merged is not None:
-                row.merged_layer_id = str(getattr(merged, "id_string", "") or "")
-                row.merged_layer_name = str(getattr(merged, "name", "") or "")
+            row.merged_layer_id = merged_layer_id
+            row.merged_layer_name = str(getattr(merged, "name", "") or getattr(target_layer, "name", "") or "")
+            row.created_layer = merged
+
+            # The generated layer was consumed by mergeDown(); keeping this id
+            # makes [X] try to delete a stale / detached layer after merge.
+            row.generation_result_layer_id = ""
+            row.generation_result_layer_name = ""
             self._attach_row_ui_metadata(row, "result")
         except Exception as exc:
             row.merge_status = "failed"

@@ -168,8 +168,21 @@ class GroupBatchDetectionService:
             result.coordinate_space,
             projection_bounds,
         )
-        crop_bbox = self._crop_bbox_for_options(source_image_bytes, bbox, options)
-        crop_bytes = self._crop_png_bytes_from_dict(source_image_bytes, crop_bbox) or source_image_bytes
+        crop_bbox = self._crop_bbox_for_options(
+            source_image_bytes,
+            bbox,
+            options,
+            projection_bounds,
+        )
+        crop_bytes = self._crop_png_bytes_from_dict(
+            source_image_bytes,
+            crop_bbox,
+            projection_bounds,
+        )
+        if not crop_bytes:
+            raise RuntimeError(
+                "BBox crop failed; refusing to use the full source projection as crop bytes."
+            )
         layer_name = self._result_layer_name(str(source_layer.name), result, index)
 
         created_layer = add_repair_result_layer_to_group(
@@ -334,7 +347,15 @@ class GroupBatchDetectionService:
         png_bytes: bytes,
         detector_bbox: dict[str, int],
         options: DetectionOptions,
+        projection_bounds: Any,
     ) -> dict[str, int]:
+        """Return document-space crop bbox for row state and layer placement.
+
+        The rendered PNG is projection-local, while detector rows and layer
+        placement use document-space coordinates. Keep the returned crop bbox in
+        document space, but do all image-size expansion/clamping in local image
+        space. This makes Force rect crop on/off use the same coordinate contract.
+        """
         if not options.force_rect_crop:
             return dict(detector_bbox)
 
@@ -342,24 +363,83 @@ class GroupBatchDetectionService:
         if not image.loadFromData(png_bytes, "PNG"):
             return dict(detector_bbox)
 
-        return expand_bbox_to_forced_rect(
+        local_detector_bbox = self._document_bbox_to_projection_local(
             detector_bbox,
+            projection_bounds,
+        )
+        local_crop_bbox = expand_bbox_to_forced_rect(
+            local_detector_bbox,
             int(image.width()),
             int(image.height()),
             int(options.rect_width),
             int(options.rect_height),
             bool(options.clamp_rect_to_source_bounds),
         )
+        return self._projection_local_bbox_to_document(
+            local_crop_bbox,
+            projection_bounds,
+        )
 
-    def _crop_png_bytes_from_dict(self, png_bytes: bytes, bbox: dict[str, int]) -> bytes | None:
+    def _document_bbox_to_projection_local(
+        self,
+        bbox: dict[str, int],
+        projection_bounds: Any,
+    ) -> dict[str, int]:
+        """Convert a document-space bbox into rendered projection PNG coordinates."""
+        offset_x = int(getattr(projection_bounds, "x", 0) or 0)
+        offset_y = int(getattr(projection_bounds, "y", 0) or 0)
+        return {
+            "x": int(bbox.get("x", 0) or 0) - offset_x,
+            "y": int(bbox.get("y", 0) or 0) - offset_y,
+            "width": int(bbox.get("width", 1) or 1),
+            "height": int(bbox.get("height", 1) or 1),
+        }
+
+    def _projection_local_bbox_to_document(
+        self,
+        bbox: dict[str, int],
+        projection_bounds: Any,
+    ) -> dict[str, int]:
+        """Convert a rendered projection PNG bbox back into document coordinates."""
+        offset_x = int(getattr(projection_bounds, "x", 0) or 0)
+        offset_y = int(getattr(projection_bounds, "y", 0) or 0)
+        return {
+            "x": int(bbox.get("x", 0) or 0) + offset_x,
+            "y": int(bbox.get("y", 0) or 0) + offset_y,
+            "width": int(bbox.get("width", 1) or 1),
+            "height": int(bbox.get("height", 1) or 1),
+        }
+
+    def _crop_png_bytes_from_dict(
+        self,
+        png_bytes: bytes,
+        bbox: dict[str, int],
+        projection_bounds: Any,
+    ) -> bytes | None:
+        """Crop rendered projection PNG using bbox converted from document space."""
         image = QtGui.QImage()
         if not image.loadFromData(png_bytes, "PNG"):
             return None
 
-        x = max(0, int(bbox.get("x", 0) or 0))
-        y = max(0, int(bbox.get("y", 0) or 0))
-        width = max(1, min(int(bbox.get("width", 1) or 1), int(image.width()) - x))
-        height = max(1, min(int(bbox.get("height", 1) or 1), int(image.height()) - y))
+        local_bbox = self._document_bbox_to_projection_local(bbox, projection_bounds)
+        x = int(local_bbox.get("x", 0) or 0)
+        y = int(local_bbox.get("y", 0) or 0)
+        width = int(local_bbox.get("width", 1) or 1)
+        height = int(local_bbox.get("height", 1) or 1)
+
+        # Clamp in projection-local coordinates. If the detector bbox starts
+        # outside the rendered image, shift the crop origin back into the image
+        # and reduce the size instead of asking Qt to copy out-of-bounds pixels,
+        # which can produce an all-black crop.
+        if x < 0:
+            width += x
+            x = 0
+        if y < 0:
+            height += y
+            y = 0
+
+        width = min(width, int(image.width()) - x)
+        height = min(height, int(image.height()) - y)
         if width <= 0 or height <= 0:
             return None
 

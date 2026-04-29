@@ -33,6 +33,7 @@ KritaRenderedImage = krita_core_adapter.KritaRenderedImage
 active_krita_document = krita_core_adapter.active_krita_document
 add_layer_only_paint_layer = krita_core_adapter.add_layer_only_paint_layer
 all_krita_nodes = krita_core_adapter.all_krita_nodes
+delete_layer = krita_core_adapter.delete_layer
 find_krita_node_by_id = krita_core_adapter.find_krita_node_by_id
 merge_layer_down = krita_core_adapter.merge_layer_down
 merge_layer_into_target = krita_core_adapter.merge_layer_into_target
@@ -168,6 +169,7 @@ __all__ = [
     "all_krita_nodes",
     "checked_state",
     "deserialize_job_params",
+    "delete_layer",
     "find_krita_node_by_id",
     "format_img_metadata",
     "is_finished_job",

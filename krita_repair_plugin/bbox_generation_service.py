@@ -195,7 +195,6 @@ class BBoxGenerationService:
             from ai_diffusion.api import (
                 ConditioningInput,
                 ExtentInput,
-                FillMode,
                 ImageInput,
                 InpaintMode,
                 InpaintParams,
@@ -234,12 +233,7 @@ class BBoxGenerationService:
 
         local_bounds = Bounds(0, 0, generation_extent.width, generation_extent.height)
         doc_bounds = Bounds(bbox["x"], bbox["y"], bbox["width"], bbox["height"])
-        mask = self.build_detector_local_mask(
-            crop_bbox=bbox,
-            detector_bbox=task.detector_bbox,
-            generation_extent=generation_extent,
-            original_extent=expected_extent,
-        )
+        whole_crop_refine = self._is_whole_crop_refine_task(task)
 
         connection = getattr(model, "_connection")
         client = connection.client
@@ -258,32 +252,48 @@ class BBoxGenerationService:
         checkpoint = copy(style.get_models(client.models.checkpoints))
         checkpoint.version = resolve_arch(style, client)
 
+        workflow_kind = WorkflowKind.refine if whole_crop_refine else WorkflowKind.refine_region
+        prompt_inpaint_mode = None if whole_crop_refine else InpaintMode.fill
+
         prepared = workflow.prepare_prompts(
             conditioning,
             style,
             seed,
             checkpoint.version,
-            InpaintMode.fill,
+            prompt_inpaint_mode,
             FileLibrary.instance(),
         )
 
-        inpaint = InpaintParams(
-            InpaintMode.fill,
-            local_bounds,
-            fill=FillMode.neutral,
-            grow=0,
-            feather=0,
-            blend=0,
-        )
+        mask = None
+        inpaint = None
+        job_has_mask = False
+        job_inpaint_mode = None
 
-        native_inpaint = getattr(model, "inpaint", None)
-        inpaint.use_inpaint_model = bool(getattr(native_inpaint, "use_inpaint", False))
-        inpaint.use_condition_mask = bool(getattr(native_inpaint, "use_prompt_focus", False))
-        inpaint.use_reference = False
+        if not whole_crop_refine:
+            mask = self.build_detector_local_mask(
+                crop_bbox=bbox,
+                detector_bbox=task.detector_bbox,
+                generation_extent=generation_extent,
+                original_extent=expected_extent,
+            )
+            inpaint = InpaintParams(
+                InpaintMode.fill,
+                local_bounds,
+                grow=0,
+                feather=0,
+                blend=0,
+            )
+
+            native_inpaint = getattr(model, "inpaint", None)
+            inpaint.use_inpaint_model = bool(getattr(native_inpaint, "use_inpaint", False))
+            inpaint.use_condition_mask = bool(getattr(native_inpaint, "use_prompt_focus", False))
+            inpaint.use_reference = False
+            job_has_mask = True
+            job_inpaint_mode = InpaintMode.fill
 
         perf = model._performance_settings(client)
         workflow_input = workflow.prepare(
-            WorkflowKind.refine_region,
+            workflow_kind,
             crop_image,
             prepared.conditioning,
             style,
@@ -303,8 +313,8 @@ class BBoxGenerationService:
             doc_bounds,
             job_name,
             seed=seed,
-            has_mask=True,
-            inpaint_mode=InpaintMode.fill,
+            has_mask=job_has_mask,
+            inpaint_mode=job_inpaint_mode,
             metadata={
                 "prompt": task.prompt_text,
                 "negative_prompt": task.base_negative,
@@ -368,6 +378,28 @@ class BBoxGenerationService:
         if mask_bounds.width <= 0 or mask_bounds.height <= 0:
             return self.build_bbox_local_mask(context)
         return Mask.rectangle(mask_bounds, context)
+
+    def _is_whole_crop_refine_task(self, task: RepairGenerationTask) -> bool:
+        """Return True when the crop itself is the full local repair target.
+
+        When crop_bbox == detector_bbox, the cropped PNG already contains exactly
+        the target local image. Running refine_region would create a full-image
+        mask and force the workflow down the inpaint path. That is the wrong
+        semantic: there is no surrounding context area to preserve. Use ordinary
+        refine for this case and only use refine_region when crop_bbox is larger
+        than detector_bbox.
+        """
+        crop = self._normalized_bbox(task.bbox)
+        detector = self._normalized_bbox(task.detector_bbox)
+        if not detector:
+            return True
+
+        return (
+            int(crop.get("x", 0)) == int(detector.get("x", 0))
+            and int(crop.get("y", 0)) == int(detector.get("y", 0))
+            and int(crop.get("width", 0)) == int(detector.get("width", 0))
+            and int(crop.get("height", 0)) == int(detector.get("height", 0))
+        )
 
     async def _enqueue_and_watch(
         self,
