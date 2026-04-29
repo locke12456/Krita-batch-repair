@@ -23,14 +23,36 @@ from .repair_compat import (
     QMessageBox,
     QPushButton,
     QScrollArea,
+    find_krita_node_by_id,
+    merge_layer_down,
+    move_layer_above,
     QVBoxLayout,
     QWidget,
+    set_layer_visible,
 )
 
 try:
     from krita import DockWidget
 except Exception:
     DockWidget = QWidget
+
+
+PROMPT_TYPE_OPTIONS = (
+    ("All", ""),
+    ("Head", "detailed head repair, natural face structure"),
+    ("Penis", "anatomically consistent penis repair"),
+    ("Pussy", "anatomically consistent pussy repair"),
+    ("Censor", "remove censorship artifact, restore natural detail"),
+    ("Other", "localized repair, coherent texture and lighting"),
+)
+
+
+def prompt_type_prompt(prompt_type: str) -> str:
+    """Return the committed prompt fragment for a prompt type label."""
+    for label, fragment in PROMPT_TYPE_OPTIONS:
+        if label == prompt_type:
+            return fragment
+    return ""
 
 
 class RepairDocker(DockWidget):
@@ -79,6 +101,13 @@ class RepairDocker(DockWidget):
         self._select_all_results_button = QPushButton("Select All Results")
         self._clear_results_button = QPushButton("Clear Results")
         self._generate_results_button = QPushButton("Generate Selected Results")
+        self._result_filter_checkbox = QCheckBox("filter")
+        self._result_filter_prompt_combo = QComboBox()
+        self._result_visible_checkbox = QCheckBox("visible")
+        self._result_invisible_checkbox = QCheckBox("invisible")
+        self._apply_result_filter_button = QPushButton("apply")
+        self._committed_result_filter_enabled = False
+        self._committed_result_filter_prompt_type = ""
         self._prompt_progress_label = QLabel("Prompt extraction: 0 / 0")
         self._select_all_button = QPushButton("Select All Groups")
         self._clear_selected_button = QPushButton("Clear Groups")
@@ -105,6 +134,8 @@ class RepairDocker(DockWidget):
 
         for mode in ("all", "head", "censor"):
             self._mode_combo.addItem(mode)
+        for prompt_type, _fragment in PROMPT_TYPE_OPTIONS:
+            self._result_filter_prompt_combo.addItem(prompt_type)
 
         root = QWidget()
         layout = QVBoxLayout()
@@ -165,6 +196,15 @@ class RepairDocker(DockWidget):
         self._result_scroll.setWidget(self._result_container)
         self._result_scroll.setWidgetResizable(True)
         layout.addWidget(QLabel("Detection Results"))
+
+        result_filter_row = QHBoxLayout()
+        result_filter_row.addWidget(self._result_filter_checkbox)
+        result_filter_row.addWidget(self._result_filter_prompt_combo)
+        result_filter_row.addWidget(self._result_visible_checkbox)
+        result_filter_row.addWidget(self._result_invisible_checkbox)
+        result_filter_row.addWidget(self._apply_result_filter_button)
+        layout.addLayout(result_filter_row)
+
         layout.addWidget(self._result_scroll)
         layout.addWidget(self._generate_results_button)
 
@@ -190,6 +230,15 @@ class RepairDocker(DockWidget):
         self._extract_tags_button.clicked.connect(self._extract_tags_for_selected_results)
         self._cancel_tags_button.clicked.connect(self._cancel_tag_extraction)
         self._generate_results_button.clicked.connect(self._generate_selected_results)
+        self._result_visible_checkbox.stateChanged.connect(
+            lambda _state: self._set_toolbar_visibility_exclusive("visible")
+        )
+        self._result_invisible_checkbox.stateChanged.connect(
+            lambda _state: self._set_toolbar_visibility_exclusive("invisible")
+        )
+        self._apply_result_filter_button.clicked.connect(
+            self._apply_result_list_visibility_filter
+        )
 
     def _current_mode(self) -> str:
         """Return the current detector mode filter."""
@@ -344,7 +393,7 @@ class RepairDocker(DockWidget):
             if widget is not None:
                 widget.deleteLater()
 
-        rows = self.result_selection_model.rows
+        rows = self._visible_result_rows_for_current_filter()
         if not rows:
             self._result_layout.addWidget(QLabel("No detection results yet."))
             return
@@ -367,6 +416,15 @@ class RepairDocker(DockWidget):
             )
         )
 
+        visible = QCheckBox("Visible")
+        visible.setChecked(bool(getattr(row, "visible", True)))
+        visible.stateChanged.connect(
+            lambda _state, target=row, widget=visible: self._set_result_visible(
+                target,
+                widget.isChecked(),
+            )
+        )
+
         active = QCheckBox("Active")
         active.setChecked(bool(row.active))
         active.stateChanged.connect(
@@ -376,12 +434,40 @@ class RepairDocker(DockWidget):
             )
         )
 
-        label = QLabel(
-            f"{row.display_name} | tag={row.prompt_status} | gen={row.generation_status}"
+        label = QLabel(self._result_row_label(row))
+
+        prompt_combo = QComboBox()
+        for prompt_type, _fragment in PROMPT_TYPE_OPTIONS:
+            prompt_combo.addItem(prompt_type)
+        self._set_combo_text(prompt_combo, row.prompt_type or "All")
+
+        apply_button = QPushButton("Apply")
+        apply_button.clicked.connect(
+            lambda _checked=False, target=row, combo=prompt_combo: self._apply_result_prompt_type(
+                target,
+                combo.currentText(),
+            )
         )
+
+        merge_button = QPushButton("Merge")
+        merge_button.setEnabled(bool(row.generation_result_layer_id))
+        merge_button.clicked.connect(
+            lambda _checked=False, target=row: self._merge_result_generation_layer(target)
+        )
+
+        delete_button = QPushButton("X")
+        delete_button.clicked.connect(
+            lambda _checked=False, target=row: self._delete_result_row(target)
+        )
+
         row_layout.addWidget(selected)
+        row_layout.addWidget(visible)
         row_layout.addWidget(active)
         row_layout.addWidget(label)
+        row_layout.addWidget(prompt_combo)
+        row_layout.addWidget(apply_button)
+        row_layout.addWidget(merge_button)
+        row_layout.addWidget(delete_button)
         return row_widget
 
     def _set_result_selected(self, row: RepairResultRow, selected: bool) -> None:
@@ -391,6 +477,168 @@ class RepairDocker(DockWidget):
     def _set_result_active(self, row: RepairResultRow, active: bool) -> None:
         """Update a detection result row active flag from the UI."""
         row.active = bool(active)
+
+    def _set_result_visible(self, row: RepairResultRow, visible: bool) -> None:
+        """Set row visibility through the adapter helper."""
+        try:
+            self._apply_row_visibility(row, visible)
+        except Exception as exc:
+            self._show_error(str(exc))
+        self._refresh_result_rows()
+
+    def _apply_row_visibility(self, row: RepairResultRow, visible: bool) -> None:
+        """Apply visibility to the primary layer target for one row."""
+        target = self._resolve_row_visibility_target(row)
+        if target is None:
+            raise RuntimeError("No layer target exists for this result row.")
+        set_layer_visible(target, bool(visible))
+        row.visible = bool(visible)
+        self._attach_row_ui_metadata(row, "result")
+
+    def _apply_result_prompt_type(self, row: RepairResultRow, prompt_type: str) -> None:
+        """Commit the prompt type dropdown to the row model and metadata."""
+        prompt_type = str(prompt_type or "").strip()
+        if not prompt_type or prompt_type == "All":
+            row.prompt_type = ""
+            row.prompt_type_prompt = ""
+            row.prompt_type_applied = False
+        else:
+            row.prompt_type = prompt_type
+            row.prompt_type_prompt = prompt_type_prompt(prompt_type)
+            row.prompt_type_applied = True
+        self._attach_row_ui_metadata(row, "prompt")
+        self._refresh_result_rows()
+
+    def _set_toolbar_visibility_exclusive(self, changed: str) -> None:
+        """Keep visible and invisible toolbar operations mutually exclusive."""
+        if changed == "visible" and self._result_visible_checkbox.isChecked():
+            self._result_invisible_checkbox.setChecked(False)
+        elif changed == "invisible" and self._result_invisible_checkbox.isChecked():
+            self._result_visible_checkbox.setChecked(False)
+
+    def _apply_result_list_visibility_filter(self) -> None:
+        """Commit the toolbar filter and optional layer visibility operation."""
+        filter_enabled = bool(self._result_filter_checkbox.isChecked())
+        prompt_type = str(self._result_filter_prompt_combo.currentText() or "").strip()
+        apply_visible = bool(self._result_visible_checkbox.isChecked())
+        apply_invisible = bool(self._result_invisible_checkbox.isChecked())
+
+        if apply_visible and apply_invisible:
+            self._show_error("Visible and invisible cannot both be selected.")
+            return
+
+        self._committed_result_filter_enabled = filter_enabled
+        self._committed_result_filter_prompt_type = prompt_type
+
+        errors: list[str] = []
+        if apply_visible or apply_invisible:
+            target_visible = bool(apply_visible)
+            for row in self.result_selection_model.visibility_target_rows(
+                prompt_type=prompt_type,
+                filter_enabled=filter_enabled,
+            ):
+                try:
+                    self._apply_row_visibility(row, target_visible)
+                except Exception as exc:
+                    errors.append(f"{row.display_name}: {exc}")
+
+        self._refresh_result_rows()
+        if errors:
+            self._show_error("\n".join(errors))
+
+    def _visible_result_rows_for_current_filter(self) -> list[RepairResultRow]:
+        """Return rows visible in the Docker result list."""
+        return self.result_selection_model.visibility_target_rows(
+            prompt_type=self._committed_result_filter_prompt_type,
+            filter_enabled=self._committed_result_filter_enabled,
+        )
+
+    def _resolve_row_visibility_target(self, row: RepairResultRow) -> Any | None:
+        """Prefer generated layer, then fallback to detection crop layer."""
+        document_ref = getattr(row.source_layer, "document_ref", None)
+        if row.generation_result_layer_id and document_ref is not None:
+            generated = find_krita_node_by_id(document_ref, row.generation_result_layer_id)
+            if generated is not None:
+                return generated
+        if row.created_layer is not None:
+            return row.created_layer
+        return None
+
+    def _delete_result_row(self, row: RepairResultRow) -> None:
+        """Safely remove a result row from the Docker model without deleting layers."""
+        if row.generation_status == "running":
+            self._show_info("Cannot remove a result row while generation is running.")
+            return
+        removed = self.result_selection_model.remove_result(row.result_id)
+        if removed is not None:
+            self._attach_row_ui_metadata(removed, "result")
+        self._refresh_result_rows()
+
+    def _merge_result_generation_layer(self, row: RepairResultRow) -> None:
+        """Move the generated layer above source and merge it down."""
+        try:
+            if not row.generation_result_layer_id:
+                raise RuntimeError("No generated layer to merge.")
+            document_ref = getattr(row.source_layer, "document_ref", None)
+            if document_ref is None:
+                raise RuntimeError("Source layer document_ref is required for merge.")
+            generated = find_krita_node_by_id(document_ref, row.generation_result_layer_id)
+            if generated is None:
+                raise RuntimeError("Generated layer could not be resolved.")
+            if row.source_layer is None:
+                raise RuntimeError("Source layer is required for merge.")
+            group_node = getattr(row.group_layer, "node", row.group_layer)
+            source_node = getattr(row.source_layer, "node", row.source_layer)
+            generated_node = getattr(generated, "node", generated)
+            if group_node is None:
+                raise RuntimeError("Group layer is required for merge.")
+            if generated_node.parentNode() != group_node or source_node.parentNode() != group_node:
+                raise RuntimeError("Generated and source layers must share the result group parent.")
+
+            moved = move_layer_above(document_ref, generated, row.source_layer)
+            merged = merge_layer_down(moved)
+            row.merge_status = "merged"
+            row.merge_error = ""
+            if merged is not None:
+                row.merged_layer_id = str(getattr(merged, "id_string", "") or "")
+                row.merged_layer_name = str(getattr(merged, "name", "") or "")
+            self._attach_row_ui_metadata(row, "result")
+        except Exception as exc:
+            row.merge_status = "failed"
+            row.merge_error = str(exc)
+            self._attach_row_ui_metadata(row, "result")
+            self._show_error(row.merge_error)
+        self._refresh_result_rows()
+
+    def _result_row_label(self, row: RepairResultRow) -> str:
+        """Return compact row text so action widgets have horizontal room."""
+        prompt = row.prompt_type if row.prompt_type_applied else "unclassified"
+        merge = getattr(row, "merge_status", "not_started")
+        return (
+            f"{row.display_name} | type={prompt} | tag={row.prompt_status} | "
+            f"gen={row.generation_status} | merge={merge}"
+        )
+
+    def _set_combo_text(self, combo: QComboBox, text: str) -> None:
+        """Best-effort select a QComboBox item by display text."""
+        find_text = getattr(combo, "findText", None)
+        set_index = getattr(combo, "setCurrentIndex", None)
+        if callable(find_text) and callable(set_index):
+            index = int(find_text(text))
+            if index >= 0:
+                set_index(index)
+
+    def _attach_row_ui_metadata(self, row: RepairResultRow, namespace: str) -> None:
+        """Attach row UI metadata to the best available layer metadata target."""
+        target = row.generation_result_layer_id or row.created_layer
+        if not target:
+            return
+        if namespace == "prompt":
+            attach = getattr(self.metadata_service, "attach_prompt_metadata", None)
+        else:
+            attach = getattr(self.metadata_service, "attach_result_metadata", None)
+        if callable(attach):
+            attach(target, row.to_metadata())
 
     def _extract_tags_for_selected_results(self) -> None:
         """Start async image2tagger extraction for selected result rows."""
@@ -426,6 +674,8 @@ class RepairDocker(DockWidget):
 
     def _on_prompt_row_finished(self, row: RepairResultRow, _result: Any | None) -> None:
         """Refresh one completed prompt row."""
+        if getattr(row, "removed", False):
+            return
         self._refresh_result_rows()
 
     def _on_prompt_completed(self, progress: PromptExtractionProgress) -> None:

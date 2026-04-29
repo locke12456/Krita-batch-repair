@@ -33,7 +33,11 @@ KritaRenderedImage = krita_core_adapter.KritaRenderedImage
 active_krita_document = krita_core_adapter.active_krita_document
 add_layer_only_paint_layer = krita_core_adapter.add_layer_only_paint_layer
 all_krita_nodes = krita_core_adapter.all_krita_nodes
+find_krita_node_by_id = krita_core_adapter.find_krita_node_by_id
+merge_layer_down = krita_core_adapter.merge_layer_down
+move_layer_above = krita_core_adapter.move_layer_above
 render_node_projection = krita_core_adapter.render_node_projection
+set_layer_visible = krita_core_adapter.set_layer_visible
 selected_krita_nodes = krita_core_adapter.selected_krita_nodes
 wrap_node = krita_core_adapter.wrap_node
 
@@ -162,13 +166,17 @@ __all__ = [
     "all_krita_nodes",
     "checked_state",
     "deserialize_job_params",
+    "find_krita_node_by_id",
     "format_img_metadata",
     "is_finished_job",
     "is_group_layer",
     "is_image_layer",
     "make_bounds",
+    "merge_layer_down",
+    "move_layer_above",
     "refresh_ai_projection",
     "render_node_projection",
+    "set_layer_visible",
     "require_ai_diffusion_api",
     "selected_krita_nodes",
     "trim_prompt",

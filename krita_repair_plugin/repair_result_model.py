@@ -21,6 +21,11 @@ GENERATION_DONE = "done"
 GENERATION_FAILED = "failed"
 GENERATION_CANCELLED = "cancelled"
 
+MERGE_NOT_STARTED = "not_started"
+MERGE_READY = "ready"
+MERGE_MERGED = "merged"
+MERGE_FAILED = "failed"
+
 
 def _safe_layer_id(layer: Any | None) -> str:
     if layer is None:
@@ -45,6 +50,15 @@ class RepairResultRow:
     result_id: str = field(default_factory=lambda: uuid4().hex)
     selected: bool = True
     active: bool = True
+    visible: bool = True
+    removed: bool = False
+    prompt_type: str = ""
+    prompt_type_prompt: str = ""
+    prompt_type_applied: bool = False
+    merge_status: str = MERGE_NOT_STARTED
+    merge_error: str = ""
+    merged_layer_id: str = ""
+    merged_layer_name: str = ""
 
     record: SyncRecord | None = None
     group_layer: Any | None = None
@@ -184,6 +198,17 @@ class RepairResultRow:
     def to_metadata(self) -> dict[str, Any]:
         return {
             "repair_plugin.result_id": self.result_id,
+            "repair_plugin.selected": bool(self.selected),
+            "repair_plugin.active": bool(self.active),
+            "repair_plugin.visible": bool(self.visible),
+            "repair_plugin.removed": bool(self.removed),
+            "repair_plugin.prompt_type": self.prompt_type,
+            "repair_plugin.prompt_type_prompt": self.prompt_type_prompt,
+            "repair_plugin.prompt_type_applied": bool(self.prompt_type_applied),
+            "repair_plugin.merge_status": self.merge_status,
+            "repair_plugin.merge_error": self.merge_error,
+            "repair_plugin.merged_layer_id": self.merged_layer_id,
+            "repair_plugin.merged_layer_name": self.merged_layer_name,
             "repair_plugin.source_group_id": self.group_id,
             "repair_plugin.source_group_name": self.group_name,
             "repair_plugin.export_key": self.export_key,
@@ -222,12 +247,47 @@ class RepairResultSelectionModel:
     def append_rows(self, rows: Iterable[RepairResultRow]) -> None:
         self.rows.extend(list(rows))
 
+    def non_removed_rows(self) -> list[RepairResultRow]:
+        return [row for row in self.rows if not row.removed]
+
+    def rows_for_prompt_type(self, prompt_type: str) -> list[RepairResultRow]:
+        prompt_type = str(prompt_type or "").strip()
+        if not prompt_type or prompt_type.lower() == "all":
+            return self.non_removed_rows()
+        return [
+            row
+            for row in self.non_removed_rows()
+            if row.prompt_type_applied and row.prompt_type == prompt_type
+        ]
+
+    def visibility_target_rows(
+        self,
+        prompt_type: str = "",
+        filter_enabled: bool = False,
+    ) -> list[RepairResultRow]:
+        if filter_enabled:
+            return self.rows_for_prompt_type(prompt_type)
+        return self.non_removed_rows()
+
+    def remove_result(self, result_id: str) -> RepairResultRow | None:
+        for row in self.rows:
+            if row.result_id == result_id:
+                row.removed = True
+                row.selected = False
+                row.active = False
+                return row
+        return None
+
     def selected_active_results(self) -> list[RepairResultRow]:
-        return [row for row in self.rows if row.selected and row.active]
+        return [
+            row
+            for row in self.rows
+            if row.selected and row.active and not row.removed
+        ]
 
     def select_all(self) -> None:
         for row in self.rows:
-            if row.active:
+            if row.active and not row.removed:
                 row.selected = True
 
     def clear_selected(self) -> None:
@@ -244,22 +304,24 @@ class RepairResultSelectionModel:
         return None
 
     def update_prompt_progress(self, completed: int, total: int) -> None:
-        for index, row in enumerate(self.rows, start=1):
+        for index, row in enumerate(self.non_removed_rows(), start=1):
             if row.prompt_status in {PROMPT_QUEUED, PROMPT_RUNNING}:
                 row.prompt_progress_index = int(completed or index)
                 row.prompt_progress_total = int(total)
 
     def counts(self) -> dict[str, int]:
+        rows = self.non_removed_rows()
         return {
-            "total": len(self.rows),
-            "selected": len([row for row in self.rows if row.selected]),
-            "active": len([row for row in self.rows if row.active]),
-            "prompt_done": len([row for row in self.rows if row.prompt_status == PROMPT_DONE]),
-            "generated": len([row for row in self.rows if row.generation_status == GENERATION_DONE]),
+            "total": len(rows),
+            "removed": len([row for row in self.rows if row.removed]),
+            "selected": len([row for row in rows if row.selected]),
+            "active": len([row for row in rows if row.active]),
+            "prompt_done": len([row for row in rows if row.prompt_status == PROMPT_DONE]),
+            "generated": len([row for row in rows if row.generation_status == GENERATION_DONE]),
             "failed": len(
                 [
                     row
-                    for row in self.rows
+                    for row in rows
                     if row.prompt_status == PROMPT_FAILED
                     or row.generation_status == GENERATION_FAILED
                 ]

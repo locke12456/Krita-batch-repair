@@ -18,7 +18,8 @@ class RepairGenerationTask:
     detector_bbox: dict[str, int]
     crop_png_bytes: bytes
     prompt_text: str
-    detector_mode: str
+    prompt_type_prompt: str = ""
+    detector_mode: str = ""
     detector_label: str
     base_positive: str = ""
     user_positive: str = ""
@@ -65,6 +66,7 @@ class BBoxGenerationService:
     ) -> tuple[str, str]:
         """Insert bbox prompt before user/base positive prompt and preserve negative prompt."""
         positive_parts = [
+            str(getattr(result_row, "prompt_type_prompt", "") or "").strip(),
             str(getattr(result_row, "prompt_text", "") or "").strip(),
             str(user_positive or "").strip(),
             str(base_positive or "").strip(),
@@ -100,6 +102,7 @@ class BBoxGenerationService:
             detector_bbox=dict(getattr(row, "detector_bbox", {}) or {}),
             crop_png_bytes=bytes(row.crop_png_bytes),
             prompt_text=positive,
+            prompt_type_prompt=str(getattr(row, "prompt_type_prompt", "") or ""),
             detector_mode=str(row.detector_mode),
             detector_label=str(row.detector_label),
             base_positive=base_positive,
@@ -275,6 +278,7 @@ class BBoxGenerationService:
             metadata={
                 "prompt": task.prompt_text,
                 "negative_prompt": task.base_negative,
+                "repair_plugin.prompt_type_prompt": task.prompt_type_prompt,
                 "repair_plugin.result_id": str(getattr(task, "result_id", "") or ""),
                 "repair_plugin.detector_mode": task.detector_mode,
                 "repair_plugin.detector_label": task.detector_label,
@@ -527,6 +531,7 @@ class BBoxGenerationService:
                     "repair_plugin.source_group_name": task.record.group_name,
                     "repair_plugin.export_key": task.record.export_key,
                     "repair_plugin.prompt_text": task.prompt_text,
+                    "repair_plugin.prompt_type_prompt": task.prompt_type_prompt,
                 },
             )
 
