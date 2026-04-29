@@ -781,10 +781,16 @@ class RepairDocker(DockWidget):
             self._show_info("No selected detection results are available.")
             return
 
+        base_positive, base_negative = self.bbox_generation_service.active_model_prompt_snapshot()
+
         errors: list[str] = []
         for row in rows:
             try:
-                result = self.bbox_generation_service.generate_result_row(row)
+                result = self.bbox_generation_service.generate_result_row(
+                    row,
+                    base_positive=base_positive,
+                    base_negative=base_negative,
+                )
                 if not result.success:
                     errors.append(result.error)
             except Exception as exc:

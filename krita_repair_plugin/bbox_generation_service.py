@@ -56,6 +56,27 @@ class BBoxGenerationService:
         self.model_resolver = model_resolver or active_ai_model
         self.on_row_finished = on_row_finished
 
+    def active_model_prompt_snapshot(self) -> tuple[str, str]:
+        """Return current KAD UI positive and negative prompts without preparing a workflow."""
+        try:
+            model = self.model_resolver()
+        except Exception:
+            return "", ""
+        if model is None:
+            return "", ""
+
+        regions = getattr(model, "active_regions", None) or getattr(model, "regions", None)
+        if regions is None:
+            return "", ""
+
+        active = getattr(regions, "active_or_root", None)
+        if active is None:
+            return "", ""
+
+        positive = str(getattr(active, "positive", "") or "").strip()
+        negative = str(getattr(active, "negative", "") or "").strip()
+        return positive, negative
+
     def build_generation_prompt(
         self,
         result_row: Any,
@@ -65,10 +86,9 @@ class BBoxGenerationService:
         user_negative: str = "",
     ) -> tuple[str, str]:
         """Insert bbox prompt before user/base positive prompt and preserve negative prompt."""
-        prompt_type_prompt = (
-            str(getattr(result_row, "prompt_type_prompt", "") or "").strip()
-            or self._prompt_type_prompt_for_row(result_row)
-        )
+        prompt_type_prompt = ""
+        if bool(getattr(result_row, "prompt_type_applied", False)):
+            prompt_type_prompt = str(getattr(result_row, "prompt_type_prompt", "") or "").strip()
         positive_parts = [
             prompt_type_prompt,
             str(getattr(result_row, "prompt_text", "") or "").strip(),
@@ -131,7 +151,8 @@ class BBoxGenerationService:
             prompt_text=positive,
             prompt_type_prompt=(
                 str(getattr(row, "prompt_type_prompt", "") or "").strip()
-                or self._prompt_type_prompt_for_row(row)
+                if bool(getattr(row, "prompt_type_applied", False))
+                else ""
             ),
             detector_mode=str(row.detector_mode),
             detector_label=str(row.detector_label),
@@ -141,13 +162,26 @@ class BBoxGenerationService:
             user_negative=user_negative,
         )
 
-    def generate_result_row(self, row: Any) -> RepairGenerationResult:
+    def generate_result_row(
+        self,
+        row: Any,
+        base_positive: str = "",
+        user_positive: str = "",
+        base_negative: str = "",
+        user_negative: str = "",
+    ) -> RepairGenerationResult:
         """Queue bbox generation for one result row and return immediately.
 
         Completion is handled asynchronously by _enqueue_and_watch(...), which updates
         the row and applies the generated layer inside the original group.
         """
-        task = self.task_from_result_row(row)
+        task = self.task_from_result_row(
+            row,
+            base_positive=base_positive,
+            user_positive=user_positive,
+            base_negative=base_negative,
+            user_negative=user_negative,
+        )
         row.mark_generation_running()
         try:
             return self.enqueue_task(task, row)
