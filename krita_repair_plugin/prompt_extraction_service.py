@@ -143,16 +143,21 @@ class PromptExtractionService:
         """Compatibility no-op; prompt extraction uses the built-in workflow."""
         return None
 
-    def build_image2tagger_workflow(self, image_base64: str = "") -> dict[str, Any]:
+    def build_image2tagger_workflow(
+        self, image_base64: str = "", threshold: float | None = None,
+    ) -> dict[str, Any]:
         """Return the built-in image2tagger workflow with optional image injection."""
         workflow = copy.deepcopy(IMAGE2TAGGER_WORKFLOW_TEMPLATE)
         workflow[STANDARD_IMAGE_NODE_ID]["inputs"][STANDARD_IMAGE_INPUT_KEY] = image_base64
+        if threshold is not None:
+            workflow[STANDARD_TAGGER_NODE_ID]["inputs"]["threshold"] = float(threshold)
         return workflow
 
     def extract_prompt_from_bytes(
         self,
         layer_id: str,
         image_bytes: bytes,
+        threshold: float | None = None,
     ) -> PromptExtractionResult:
         """Run prompt extraction directly from bbox crop PNG bytes."""
         if not image_bytes:
@@ -165,7 +170,7 @@ class PromptExtractionService:
             )
 
         try:
-            workflow = self.build_image2tagger_workflow()
+            workflow = self.build_image2tagger_workflow(threshold=threshold)
             client = self.client_factory(self.connected_comfy_url())
             runtime_workflow = self.inject_image(workflow, image_bytes)
             prompt_id = client.submit(runtime_workflow)

@@ -28,11 +28,13 @@ class PromptExtractionWorker:
         on_progress: ProgressCallback | None = None,
         on_row_finished: RowCallback | None = None,
         on_completed: ProgressCallback | None = None,
+        threshold: float | None = None,
     ) -> None:
         self.service = service
         self.on_progress = on_progress
         self.on_row_finished = on_row_finished
         self.on_completed = on_completed
+        self.threshold = threshold
         self.rows: list[RepairResultRow] = []
         self.cancelled = False
         self._task: Any | None = None
@@ -82,6 +84,7 @@ class PromptExtractionWorker:
                 self.service.extract_prompt_from_bytes,
                 row.result_id,
                 row.crop_png_bytes,
+                self.threshold,
             )
             results.append(result)
 

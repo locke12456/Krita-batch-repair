@@ -59,6 +59,7 @@ QPushButton = qt_compat.QPushButton
 QScrollArea = qt_compat.QScrollArea
 QVBoxLayout = qt_compat.QVBoxLayout
 QWidget = qt_compat.QWidget
+QPlainTextEdit = qt_compat.QtWidgets.QPlainTextEdit
 checked_state = qt_compat.checked_state
 unchecked_state = qt_compat.unchecked_state
 
@@ -145,6 +146,7 @@ __all__ = [
     "QLabel",
     "QLineEdit",
     "QMessageBox",
+    "QPlainTextEdit",
     "QPushButton",
     "QScrollArea",
     "QVBoxLayout",

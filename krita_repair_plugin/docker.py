@@ -8,6 +8,7 @@ from .bbox_generation_service import BBoxGenerationService
 from .detection_service import DetectionOptions
 from .detector_model_manager import DetectorModelManager
 from .group_batch_detection_service import GroupBatchDetectionService, GroupDetectionReport
+from .group_refine_service import GroupRefineService
 from .group_selection_model import GroupSelectionModel, RepairGroupRow
 from .group_sync_source import GroupSyncSource
 from .layer_metadata_service import LayerMetadataService
@@ -30,6 +31,7 @@ from .repair_compat import (
     QWidget,
     set_layer_visible,
 )
+from .repair_log_docker import RepairLogDocker
 
 try:
     from krita import DockWidget
@@ -82,14 +84,24 @@ class RepairDocker(DockWidget):
             self.prompt_extraction_service,
             self.result_selection_model,
         )
+        self.group_refine_service = GroupRefineService(
+            bbox_generation_service=self.bbox_generation_service,
+            metadata_service=self.metadata_service,
+        )
+
+        self._log_docker = RepairLogDocker()
 
         self._status_label = QLabel("Detector: unloaded")
         self._mode_combo = QComboBox()
+        self._censor_filter_combo = QComboBox()
+        self._censor_filter_label = QLabel("Censor filter")
         self._refresh_groups_button = QPushButton("Refresh Groups")
         self._load_button = QPushButton("Load Detector")
         self._unload_button = QPushButton("Unload Detector")
         self._detect_button = QPushButton("Batch Detect Selected Groups")
+        self._refine_groups_button = QPushButton("Refine Selected Groups")
         self._image2tagger_checkbox = QCheckBox("Use image2tagger prompt")
+        self._image2tagger_threshold_input = QLineEdit("0.8")
         self._generation_checkbox = QCheckBox("Generate bbox repair")
         self._force_rect_checkbox = QCheckBox("Force rect crop")
         self._rect_width_input = QLineEdit("260")
@@ -101,6 +113,7 @@ class RepairDocker(DockWidget):
         self._select_all_results_button = QPushButton("Select All Results")
         self._clear_results_button = QPushButton("Clear Results")
         self._generate_results_button = QPushButton("Generate Selected Results")
+        self._batch_merge_button = QPushButton("Batch Merge Selected Results")
         self._result_filter_checkbox = QCheckBox("filter")
         self._result_filter_prompt_combo = QComboBox()
         self._result_visible_checkbox = QCheckBox("visible")
@@ -153,6 +166,14 @@ class RepairDocker(DockWidget):
         mode_row.addWidget(self._mode_combo)
         layout.addLayout(mode_row)
 
+        for censor_label in ("All", "penis", "pussy"):
+            self._censor_filter_combo.addItem(censor_label)
+        censor_filter_row = QHBoxLayout()
+        censor_filter_row.addWidget(self._censor_filter_label)
+        censor_filter_row.addWidget(self._censor_filter_combo)
+        layout.addLayout(censor_filter_row)
+        self._refresh_detector_filter_visibility()
+
         selection_row = QHBoxLayout()
         selection_row.addWidget(self._select_all_button)
         selection_row.addWidget(self._clear_selected_button)
@@ -160,6 +181,8 @@ class RepairDocker(DockWidget):
 
         option_row = QHBoxLayout()
         option_row.addWidget(self._image2tagger_checkbox)
+        option_row.addWidget(QLabel("Threshold"))
+        option_row.addWidget(self._image2tagger_threshold_input)
         option_row.addWidget(self._generation_checkbox)
         layout.addLayout(option_row)
 
@@ -172,6 +195,7 @@ class RepairDocker(DockWidget):
         rect_row.addWidget(self._clamp_rect_checkbox)
         layout.addLayout(rect_row)
 
+        layout.addWidget(self._refine_groups_button)
         layout.addWidget(self._detect_button)
         layout.addWidget(self._status_label)
 
@@ -190,7 +214,6 @@ class RepairDocker(DockWidget):
         tag_row.addWidget(self._extract_tags_button)
         tag_row.addWidget(self._cancel_tags_button)
         layout.addLayout(tag_row)
-        layout.addWidget(self._prompt_progress_label)
 
         self._result_container.setLayout(self._result_layout)
         self._result_scroll.setWidget(self._result_container)
@@ -207,8 +230,8 @@ class RepairDocker(DockWidget):
 
         layout.addWidget(self._result_scroll)
         layout.addWidget(self._generate_results_button)
+        layout.addWidget(self._batch_merge_button)
 
-        layout.addWidget(self._report_label)
         self._refresh_group_rows()
         self._refresh_result_rows()
 
@@ -222,7 +245,11 @@ class RepairDocker(DockWidget):
         self._refresh_groups_button.clicked.connect(self._refresh_groups)
         self._load_button.clicked.connect(self._load_detector)
         self._unload_button.clicked.connect(self._unload_detector)
+        self._mode_combo.currentIndexChanged.connect(
+            lambda _index: self._refresh_detector_filter_visibility()
+        )
         self._detect_button.clicked.connect(self._batch_detect_selected_groups)
+        self._refine_groups_button.clicked.connect(self._refine_selected_groups)
         self._select_all_button.clicked.connect(self._select_all_groups)
         self._clear_selected_button.clicked.connect(self._clear_groups)
         self._select_all_results_button.clicked.connect(self._select_all_results)
@@ -230,6 +257,7 @@ class RepairDocker(DockWidget):
         self._extract_tags_button.clicked.connect(self._extract_tags_for_selected_results)
         self._cancel_tags_button.clicked.connect(self._cancel_tag_extraction)
         self._generate_results_button.clicked.connect(self._generate_selected_results)
+        self._batch_merge_button.clicked.connect(self._batch_merge_selected_results)
         self._result_visible_checkbox.stateChanged.connect(
             lambda _state: self._set_toolbar_visibility_exclusive("visible")
         )
@@ -247,7 +275,13 @@ class RepairDocker(DockWidget):
 
     def _detection_options(self) -> DetectionOptions:
         """Return detection options from the current UI controls."""
+        filter_label: str | None = None
+        if self._current_mode() == "censor":
+            raw = str(self._censor_filter_combo.currentText() or "").strip()
+            if raw and raw != "All":
+                filter_label = raw
         return DetectionOptions(
+            filter_label=filter_label,
             force_rect_crop=self._force_rect_checkbox.isChecked(),
             rect_width=max(1, int(self._rect_width_input.text() or "260")),
             rect_height=max(1, int(self._rect_height_input.text() or "340")),
@@ -356,9 +390,11 @@ class RepairDocker(DockWidget):
 
         resolved = "resolved" if row.is_resolved else "unresolved"
         warnings = "; ".join(row.warnings)
+        refine_tag = row.refine_reason
         label = QLabel(
             f"#{row.sync_index} | {row.display_name} | {row.export_key} | "
             f"layers={len(row.layer_ids)} | {resolved} | created={row.detected_count}"
+            + (f" | refine={refine_tag}" if refine_tag else "")
             + (f" | {warnings}" if warnings else "")
         )
 
@@ -690,6 +726,27 @@ class RepairDocker(DockWidget):
             self._show_error(row.merge_error)
         self._refresh_result_rows()
 
+    def _batch_merge_selected_results(self) -> None:
+        """Batch merge all eligible selected result rows."""
+        rows = self.result_selection_model.selected_active_results()
+        eligible = [
+            row for row in rows
+            if row.generation_status == "done" and row.merge_status != "merged"
+        ]
+        if not eligible:
+            self._show_info("No selected results are eligible for batch merge.")
+            return
+
+        for row in eligible:
+            self._merge_result_generation_layer(row)
+
+        success_count = sum(1 for r in eligible if r.merge_status == "merged")
+        failed_count = sum(1 for r in eligible if r.merge_status == "failed")
+        self._log_docker.set_report(
+            f"Batch Merge Report: success={success_count}, "
+            f"failed={failed_count}, total={len(eligible)}"
+        )
+
     def _result_row_label(self, row: RepairResultRow) -> str:
         """Return compact row text so action widgets have horizontal room."""
         prompt = row.effective_prompt_type() or "unclassified"
@@ -730,11 +787,13 @@ class RepairDocker(DockWidget):
 
     def _start_prompt_worker(self, rows: list[RepairResultRow]) -> None:
         """Create and start a prompt extraction worker."""
+        threshold = self._parse_image2tagger_threshold()
         self.prompt_worker = PromptExtractionWorker(
             self.prompt_extraction_service,
             on_progress=self._on_prompt_progress,
             on_row_finished=self._on_prompt_row_finished,
             on_completed=self._on_prompt_completed,
+            threshold=threshold,
         )
         self.prompt_worker.enqueue(rows)
         self._refresh_result_rows()
@@ -748,7 +807,7 @@ class RepairDocker(DockWidget):
 
     def _on_prompt_progress(self, progress: PromptExtractionProgress) -> None:
         """Update visible prompt extraction progress."""
-        self._prompt_progress_label.setText(
+        self._log_docker.append_log(
             f"Prompt extraction: {progress.completed} / {progress.total}"
         )
 
@@ -760,14 +819,22 @@ class RepairDocker(DockWidget):
 
     def _on_prompt_completed(self, progress: PromptExtractionProgress) -> None:
         """Refresh prompt extraction completion state."""
-        self._prompt_progress_label.setText(
+        self._log_docker.append_log(
             f"Prompt extraction: {progress.completed} / {progress.total}"
             + (" cancelled" if progress.cancelled else "")
         )
         self._refresh_result_rows()
 
-    def _on_generation_row_finished(self, row: RepairResultRow, result: Any) -> None:
-        """Refresh result rows after async bbox generation completes."""
+    def _on_generation_row_finished(self, row: Any, result: Any) -> None:
+        """Refresh rows after async bbox generation completes."""
+        if getattr(row, "is_refine_proxy", False):
+            self._refresh_group_rows()
+            status = "success" if getattr(result, "success", False) else "failed"
+            error = str(getattr(result, "error", "") or "")
+            self._log_docker.append_log(
+                f"Refine generation {status}" + (f": {error}" if error else "")
+            )
+            return
         self._refresh_result_rows()
         if result is not None and not getattr(result, "success", False):
             error = str(getattr(result, "error", "") or "")
@@ -803,7 +870,7 @@ class RepairDocker(DockWidget):
     def _refresh_report(self, reports: list[GroupDetectionReport]) -> None:
         """Render a traceable batch report."""
         if not reports:
-            self._report_label.setText("Batch Report: no detector results.")
+            self._log_docker.set_report("Batch Report: no detector results.")
             return
 
         created = [report for report in reports if report.created_layer_id]
@@ -834,13 +901,63 @@ class RepairDocker(DockWidget):
         if remaining > 0:
             lines.append(f"... {remaining} more result(s)")
 
-        self._report_label.setText("\n".join(lines))
+        self._log_docker.set_report("\n".join(lines))
 
     def _refresh_status(self) -> None:
         """Refresh detector status text."""
         status = self.detector_manager.status()
         modes = ", ".join(status.loaded_modes) if status.loaded_modes else "none"
         self._status_label.setText(f"Detector: {status.state}; loaded modes: {modes}")
+
+    def _refresh_detector_filter_visibility(self) -> None:
+        """Show censor filter controls only when detector mode is censor."""
+        is_censor = self._current_mode() == "censor"
+        self._censor_filter_combo.setVisible(is_censor)
+        self._censor_filter_label.setVisible(is_censor)
+
+    def _parse_image2tagger_threshold(self) -> float | None:
+        """Parse the image2tagger threshold input, returning None on invalid."""
+        raw = str(self._image2tagger_threshold_input.text() or "").strip()
+        if not raw:
+            return None
+        try:
+            value = float(raw)
+            if not (0.0 <= value <= 1.0):
+                self._show_error(
+                    f"Image2tagger threshold must be between 0.0 and 1.0, got {value}"
+                )
+                return None
+            return value
+        except ValueError:
+            self._show_error(f"Image2tagger threshold is not a valid number: {raw}")
+            return None
+
+    def _refine_selected_groups(self) -> None:
+        """Run group refine for selected eligible group rows."""
+        try:
+            rows = self.group_selection_model.selected_active_groups()
+            if not rows:
+                self._show_info("No selected resolved groups are available.")
+                return
+            eligible = [row for row in rows if row.refine_eligible]
+            if not eligible:
+                reasons = set(row.refine_reason for row in rows)
+                self._show_info(
+                    "No selected groups are eligible for refine. "
+                    f"Reasons: {', '.join(reasons)}"
+                )
+                return
+            reports = self.group_refine_service.refine_rows(eligible)
+            self._refresh_group_rows()
+            success = sum(1 for r in reports if r.get("status") == "success")
+            skipped = sum(1 for r in reports if r.get("status") == "skipped")
+            failed = sum(1 for r in reports if r.get("status") == "failed")
+            self._log_docker.set_report(
+                f"Refine Report: success={success}, skipped={skipped}, "
+                f"failed={failed}, total={len(reports)}"
+            )
+        except Exception as exc:
+            self._show_error(str(exc))
 
     def _show_info(self, message: str) -> None:
         """Display an informational message."""
@@ -855,3 +972,9 @@ class RepairDocker(DockWidget):
             QMessageBox.critical(self, "Auto Detect Repair", message)
         except Exception:
             print(message)
+
+    def closeEvent(self, event: Any) -> None:
+        """Close log docker when main docker closes."""
+        if hasattr(self, "_log_docker") and self._log_docker is not None:
+            self._log_docker.close()
+        super().closeEvent(event)
