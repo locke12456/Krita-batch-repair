@@ -6,7 +6,14 @@ from typing import Any, Callable
 
 from krita_ai_metadata.sync_map_store import SyncRecord
 
-from .repair_compat import active_ai_model, add_repair_result_layer_to_group
+from .repair_compat import (
+    QtCore,
+    QtGui,
+    active_ai_model,
+    add_repair_result_layer_to_group,
+    move_layer_immediately_above,
+    render_node_projection,
+)
 
 
 @dataclass(slots=True)
@@ -189,12 +196,153 @@ class BBoxGenerationService:
             row.mark_generation_failed(str(exc))
             raise
 
+    def snapshot_group_crop(self, group_layer: Any, crop_bbox: dict[str, int]) -> bytes | None:
+        """Take a fresh snapshot of the group layer projection, cropped to bbox.
+
+        Unlike the detection-time cache (which snapshots a single source layer),
+        this captures the full group composite — including any previously applied
+        generation result layers that sit at the top of the group.
+        """
+        try:
+            rendered = render_node_projection(group_layer)
+        except Exception as exc:
+            print(f"[BBoxGenerationService] WARNING: group snapshot failed: {exc}")
+            return None
+        projection_bounds = rendered.bounds
+        image_bytes = bytes(rendered.to_bytes())
+
+        image = QtGui.QImage()
+        if not image.loadFromData(image_bytes, "PNG"):
+            return None
+
+        # Convert document-space crop_bbox to projection-local coordinates
+        offset_x = int(getattr(projection_bounds, "x", 0) or 0)
+        offset_y = int(getattr(projection_bounds, "y", 0) or 0)
+        bbox = self._normalized_bbox(crop_bbox)
+        x = bbox["x"] - offset_x
+        y = bbox["y"] - offset_y
+        width = bbox["width"]
+        height = bbox["height"]
+
+        # Clamp to image bounds (same pattern as GroupBatchDetectionService)
+        if x < 0:
+            width += x
+            x = 0
+        if y < 0:
+            height += y
+            y = 0
+        width = min(width, int(image.width()) - x)
+        height = min(height, int(image.height()) - y)
+        if width <= 0 or height <= 0:
+            return None
+
+        crop = image.copy(x, y, width, height)
+        data = QtCore.QByteArray()
+        buffer = QtCore.QBuffer(data)
+        open_mode = getattr(QtCore.QIODevice, "OpenModeFlag", None)
+        if open_mode is not None and hasattr(open_mode, "WriteOnly"):
+            buffer.open(open_mode.WriteOnly)
+        else:
+            buffer.open(QtCore.QIODevice.WriteOnly)
+        crop.save(buffer, "PNG")
+        buffer.close()
+        return bytes(data)
+
     def enqueue_task(self, task: RepairGenerationTask, row: Any | None = None) -> RepairGenerationResult:
         self.validate_task(task)
         model = self.resolve_model()
+
+        # Fresh snapshot: re-crop from group composite so the image
+        # includes any previously applied generation result layers.
+        fresh_crop = self.snapshot_group_crop(task.group_layer, task.bbox)
+        if fresh_crop:
+            task.crop_png_bytes = fresh_crop
+
         workflow_input, job_params = self.build_workflow_input(task, model)
         self._run_async(self._enqueue_and_watch(model, task, workflow_input, job_params, row))
         return RepairGenerationResult(task=task, success=True)
+
+
+    def enqueue_batch_sequential(
+        self,
+        tasks_and_rows: list[tuple[RepairGenerationTask, Any]],
+    ) -> None:
+        """Queue tasks sequentially -- each waits for completion before next.
+
+        Unlike the per-row fire-and-forget path (enqueue_task / generate_result_row),
+        this coroutine processes one task at a time so that each fresh snapshot
+        captures previously applied generation results in the group composite.
+        """
+        if not tasks_and_rows:
+            return
+        model = self.resolve_model()
+        self._run_async(self._generate_batch_sequential(model, tasks_and_rows))
+
+    async def _generate_batch_sequential(
+        self,
+        model: Any,
+        tasks_and_rows: list[tuple[RepairGenerationTask, Any]],
+    ) -> None:
+        """Process tasks one-by-one: snapshot -> build -> enqueue -> await -> apply -> next."""
+        from ai_diffusion.jobs import JobKind, JobState
+
+        for idx, (task, row) in enumerate(tasks_and_rows):
+            result: RepairGenerationResult | None = None
+            job_id = ""
+            try:
+                # 1. Fresh snapshot (captures any previously applied layers)
+                fresh_crop = self.snapshot_group_crop(task.group_layer, task.bbox)
+                if fresh_crop:
+                    task.crop_png_bytes = fresh_crop
+
+                # 2. Build workflow input
+                self.validate_task(task)
+                workflow_input, job_params = self.build_workflow_input(task, model)
+
+                # 3. Enqueue and await completion
+                if row is not None:
+                    row.mark_generation_running()
+                job = model.jobs.add(JobKind.live_preview, job_params)
+                await model._enqueue_job(job, workflow_input, front=False)
+                job_id = str(getattr(job, "id", "") or "")
+                if row is not None:
+                    row.mark_generation_running(job_id)
+
+                while getattr(job, "state", None) not in {
+                    JobState.finished,
+                    JobState.cancelled,
+                }:
+                    await asyncio.sleep(0.1)
+
+                if getattr(job, "state", None) is not JobState.finished:
+                    raise RuntimeError("BBox generation job was cancelled or interrupted.")
+                if len(job.results) <= 0:
+                    raise RuntimeError("BBox generation job finished without output image.")
+
+                # 4. Apply result to group (includes move-to-top)
+                result = self.apply_image_result_to_group(
+                    task, job.results[0], job_id=job_id,
+                )
+                if row is not None:
+                    row.mark_generation_done(
+                        result.created_layer_id,
+                        result.created_layer_name,
+                        job_id,
+                    )
+                    row.generation_order = idx
+
+            except Exception as exc:
+                result = RepairGenerationResult(
+                    task=task,
+                    success=False,
+                    job_id=job_id,
+                    error=str(exc),
+                )
+                if row is not None:
+                    row.mark_generation_failed(str(exc), job_id)
+            finally:
+                if row is not None and result is not None:
+                    self._notify_row_finished(row, result)
 
     def resolve_model(self) -> Any:
         """Resolve an active connected krita-ai-diffusion model."""
@@ -310,12 +458,21 @@ class BBoxGenerationService:
                 generation_extent=generation_extent,
                 original_extent=expected_extent,
             )
+            # --- Mask feather / grow / blend (match KAD native pipeline) ---
+            # Mirrors model.calc_selection_pre_process() using settings defaults.
+            # settings is already imported in this try block.
+            _diag = (generation_extent.width ** 2 + generation_extent.height ** 2) ** 0.5
+            _feather_rel = (settings.selection_feather / 100.0) * strength
+            _feather = max(int(_feather_rel * _diag), settings.selection_min_transition)
+            _grow = settings.selection_grow_offset + _feather // 2
+            _blend = min(settings.selection_blend, _grow + _feather // 2)
+
             inpaint = InpaintParams(
                 InpaintMode.fill,
                 local_bounds,
-                grow=0,
-                feather=0,
-                blend=0,
+                grow=_grow,
+                feather=_feather,
+                blend=_blend,
             )
 
             native_inpaint = getattr(model, "inpaint", None)
@@ -519,6 +676,76 @@ class BBoxGenerationService:
         """Compatibility entry point: queue the task without falling back to full canvas."""
         return self.enqueue_task(task)
 
+    def _move_layer_to_group_top(
+        self,
+        document_ref: Any,
+        created_layer: Any,
+        group_layer: Any,
+    ) -> None:
+        """Move created_layer to the top of group_layer's child stack.
+
+        Generation results must be at the top so that subsequent group
+        snapshots (via render_node_projection) include previously generated
+        layers in the composite.
+
+        Strategy:
+        1. Primary: use move_layer_immediately_above (krita_core_adapter wrapper)
+        2. Fallback: use Krita Node API (removeChildNode + addChildNode)
+        """
+        try:
+            group_node = getattr(group_layer, "node", group_layer)
+            created_node = getattr(created_layer, "node", created_layer)
+            children = group_node.childNodes()
+            if not children:
+                return
+            # childNodes() order: bottom -> top; children[-1] is topmost
+            topmost = children[-1]
+            if topmost is created_node:
+                return  # already at top
+
+            moved = False
+
+            # Strategy 1: wrapped adapter API
+            try:
+                move_layer_immediately_above(
+                    document_ref, created_layer, topmost,
+                )
+                moved = True
+            except Exception as move_exc:
+                print(
+                    f"[BBoxGenerationService] move_layer_immediately_above "
+                    f"failed, trying Node API fallback: {move_exc}"
+                )
+
+            # Strategy 2: Krita Node API fallback
+            if not moved:
+                try:
+                    group_node.removeChildNode(created_node)
+                    # Re-fetch children after removal
+                    children = group_node.childNodes()
+                    if children:
+                        # addChildNode(child, above) places child above the ref
+                        group_node.addChildNode(created_node, children[-1])
+                    else:
+                        group_node.addChildNode(created_node, None)
+                    moved = True
+                except Exception as node_exc:
+                    print(
+                        f"[BBoxGenerationService] Node API fallback also "
+                        f"failed: {node_exc}"
+                    )
+
+            if moved and callable(
+                getattr(document_ref, "refresh_projection", None)
+            ):
+                document_ref.refresh_projection()
+
+        except Exception as exc:
+            print(
+                f"[BBoxGenerationService] WARNING: could not move layer "
+                f"to group top: {exc}"
+            )
+
     def apply_result_to_group(
         self,
         task: RepairGenerationTask,
@@ -548,6 +775,7 @@ class BBoxGenerationService:
             x=bbox["x"],
             y=bbox["y"],
         )
+        self._move_layer_to_group_top(document_ref, created_layer, task.group_layer)
         result = RepairGenerationResult(
             task=task,
             success=True,

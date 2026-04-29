@@ -733,6 +733,8 @@ class RepairDocker(DockWidget):
             row for row in rows
             if row.generation_status == "done" and row.merge_status != "merged"
         ]
+        # Sort by generation order so merge applies in the same sequence as generation
+        eligible.sort(key=lambda r: r.generation_order if r.generation_order >= 0 else float('inf'))
         if not eligible:
             self._show_info("No selected results are eligible for batch merge.")
             return
@@ -842,7 +844,7 @@ class RepairDocker(DockWidget):
                 self._show_error(error)
 
     def _generate_selected_results(self) -> None:
-        """Generate bbox repairs for selected detection result rows."""
+        """Generate bbox repairs for selected detection result rows (sequential)."""
         rows = self.result_selection_model.selected_active_results()
         if not rows:
             self._show_info("No selected detection results are available.")
@@ -850,22 +852,21 @@ class RepairDocker(DockWidget):
 
         base_positive, base_negative = self.bbox_generation_service.active_model_prompt_snapshot()
 
-        errors: list[str] = []
+        tasks_and_rows: list[tuple] = []
         for row in rows:
             try:
-                result = self.bbox_generation_service.generate_result_row(
+                task = self.bbox_generation_service.task_from_result_row(
                     row,
                     base_positive=base_positive,
                     base_negative=base_negative,
                 )
-                if not result.success:
-                    errors.append(result.error)
+                tasks_and_rows.append((task, row))
             except Exception as exc:
                 row.mark_generation_failed(str(exc))
-                errors.append(str(exc))
+
+        if tasks_and_rows:
+            self.bbox_generation_service.enqueue_batch_sequential(tasks_and_rows)
         self._refresh_result_rows()
-        if errors:
-            self._show_error("\n".join(error for error in errors if error))
 
     def _refresh_report(self, reports: list[GroupDetectionReport]) -> None:
         """Render a traceable batch report."""

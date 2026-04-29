@@ -108,6 +108,7 @@ class RepairResultRow:
     generation_result_layer_id: str = ""
     generation_result_layer_name: str = ""
     generation_error: str = ""
+    generation_order: int = -1
 
     @property
     def group_id(self) -> str | None:
@@ -265,6 +266,7 @@ class RepairResultRow:
             "repair_plugin.generation_result_layer_id": self.generation_result_layer_id,
             "repair_plugin.generation_result_layer_name": self.generation_result_layer_name,
             "repair_plugin.generation_error": self.generation_error,
+            "repair_plugin.generation_order": self.generation_order,
         }
 
 
