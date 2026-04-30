@@ -119,6 +119,8 @@ class RepairDocker(DockWidget):
         self._select_all_results_button = QPushButton("Select All Results")
         self._clear_results_button = QPushButton("Clear Results")
         self._generate_results_button = QPushButton("Generate Selected Results")
+        self._attach_mask_checkbox = QCheckBox("Attach transparency mask")
+        self._attach_mask_checkbox.setChecked(True)
         self._batch_merge_button = QPushButton("Batch Remove Selected Results")
         self._result_filter_checkbox = QCheckBox("filter")
         self._result_filter_prompt_combo = QComboBox()
@@ -238,6 +240,7 @@ class RepairDocker(DockWidget):
         layout.addLayout(result_filter_row)
 
         layout.addWidget(self._result_scroll)
+        layout.addWidget(self._attach_mask_checkbox)
         layout.addWidget(self._generate_results_button)
         layout.addWidget(self._batch_merge_button)
 
@@ -898,6 +901,7 @@ class RepairDocker(DockWidget):
                     base_positive=base_positive,
                     base_negative=base_negative,
                 )
+                task.attach_transparency_mask = self._attach_mask_checkbox.isChecked()
                 tasks_and_rows.append((task, row))
             except Exception as exc:
                 row.mark_generation_failed(str(exc))

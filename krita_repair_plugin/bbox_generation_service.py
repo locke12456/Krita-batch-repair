@@ -32,6 +32,7 @@ class RepairGenerationTask:
     user_positive: str = ""
     base_negative: str = ""
     user_negative: str = ""
+    attach_transparency_mask: bool = True
 
 
 @dataclass(slots=True)
@@ -775,12 +776,15 @@ class BBoxGenerationService:
             y=bbox["y"],
         )
         self._move_layer_to_group_top(document_ref, created_layer, task.group_layer)
-        self._attach_inward_blur_transparency_mask(
-            document_ref=document_ref,
-            layer_ref=created_layer,
-            bbox=bbox,
-            blur_px=24,
-        )
+        # Refine: never attach mask. Detection: follow task flag.
+        is_refine = str(getattr(task, "detector_mode", "") or "").strip().lower() == "refine"
+        if not is_refine and task.attach_transparency_mask:
+            self._attach_inward_blur_transparency_mask(
+                document_ref=document_ref,
+                layer_ref=created_layer,
+                bbox=bbox,
+                blur_px=24,
+            )
         result = RepairGenerationResult(
             task=task,
             success=True,
