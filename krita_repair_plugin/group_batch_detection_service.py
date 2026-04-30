@@ -394,7 +394,7 @@ class GroupBatchDetectionService:
             int(options.rect_width),
             int(options.rect_height),
             bool(options.clamp_rect_to_source_bounds),
-            min_margin=0,
+            min_margin=100,
         )
         return self._projection_local_bbox_to_document(
             local_crop_bbox,
