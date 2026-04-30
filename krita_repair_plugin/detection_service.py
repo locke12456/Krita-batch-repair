@@ -53,8 +53,14 @@ def expand_bbox_to_forced_rect(
     target_width: int,
     target_height: int,
     clamp_to_bounds: bool = True,
+    min_margin: int = 100,
 ) -> dict[str, int]:
-    """Expand a detector bbox around its center to a fixed crop rectangle."""
+    """Expand a detector bbox around its center to a fixed crop rectangle.
+
+    min_margin guarantees at least this many pixels of surrounding context
+    on each side, so that the mask-to-crop ratio stays reasonable for
+    inpainting regardless of detector bbox size.
+    """
     x = int(bbox.get("x", bbox.get("x1", 0)) or 0)
     y = int(bbox.get("y", bbox.get("y1", 0)) or 0)
     width = int(bbox.get("width", 0) or 0)
@@ -66,8 +72,9 @@ def expand_bbox_to_forced_rect(
 
     bbox_width = max(1, width)
     bbox_height = max(1, height)
-    actual_width = max(int(target_width), bbox_width)
-    actual_height = max(int(target_height), bbox_height)
+    margin = max(0, int(min_margin))
+    actual_width = max(int(target_width), bbox_width + margin * 2)
+    actual_height = max(int(target_height), bbox_height + margin * 2)
 
     # Clamp target to image dimensions so the sequential shift-then-truncate
     # logic below never produces a rect smaller than intended (fix: black frame).
