@@ -355,10 +355,12 @@ class GroupBatchDetectionService:
         placement use document-space coordinates. Keep the returned crop bbox in
         document space, but do all image-size expansion/clamping in local image
         space. This makes Force rect crop on/off use the same coordinate contract.
-        """
-        if not options.force_rect_crop:
-            return dict(detector_bbox)
 
+        When force_rect_crop is off, the crop is still expanded beyond the
+        detector bbox by min_margin so that crop > detector. This ensures
+        refine_region (with mask + inpaint) is used instead of whole-crop
+        refine (no mask), giving consistent feathered output.
+        """
         image = QtGui.QImage()
         if not image.loadFromData(png_bytes, "PNG"):
             return dict(detector_bbox)
@@ -367,6 +369,24 @@ class GroupBatchDetectionService:
             detector_bbox,
             projection_bounds,
         )
+
+        if not options.force_rect_crop:
+            # Auto-expand: use detector size as target, add margin for context
+            local_crop_bbox = expand_bbox_to_forced_rect(
+                local_detector_bbox,
+                int(image.width()),
+                int(image.height()),
+                int(local_detector_bbox.get("width", 1)),
+                int(local_detector_bbox.get("height", 1)),
+                True,
+                min_margin=100,
+            )
+            return self._projection_local_bbox_to_document(
+                local_crop_bbox,
+                projection_bounds,
+            )
+
+        # Force rect crop: use exact user-specified size, no extra margin
         local_crop_bbox = expand_bbox_to_forced_rect(
             local_detector_bbox,
             int(image.width()),
@@ -374,6 +394,7 @@ class GroupBatchDetectionService:
             int(options.rect_width),
             int(options.rect_height),
             bool(options.clamp_rect_to_source_bounds),
+            min_margin=0,
         )
         return self._projection_local_bbox_to_document(
             local_crop_bbox,
