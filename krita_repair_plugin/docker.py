@@ -81,6 +81,7 @@ class RepairDocker(DockWidget):
         self.bbox_generation_service = BBoxGenerationService(
             metadata_service=self.metadata_service,
             on_row_finished=self._on_generation_row_finished,
+            log_callback=lambda msg: self._log_docker.append_log(msg),
         )
         self.group_batch_detection_service = GroupBatchDetectionService(
             self.detector_manager,

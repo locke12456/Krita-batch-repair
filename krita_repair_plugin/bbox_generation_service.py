@@ -54,15 +54,19 @@ class BBoxGenerationService:
     client/job queue, then applies the returned image into the original group layer.
     """
 
+    _DEBUG = False
+
     def __init__(
         self,
         metadata_service: Any | None = None,
         model_resolver: Callable[[], Any] | None = None,
         on_row_finished: Callable[[Any, RepairGenerationResult], None] | None = None,
+        log_callback: Callable[[str], None] | None = None,
     ) -> None:
         self.metadata_service = metadata_service
         self.model_resolver = model_resolver or active_ai_model
         self.on_row_finished = on_row_finished
+        self.log_callback = log_callback
 
     def active_model_prompt_snapshot(self) -> tuple[str, str]:
         """Return current KAD UI positive and negative prompts without preparing a workflow."""
@@ -197,7 +201,7 @@ class BBoxGenerationService:
             row.mark_generation_failed(str(exc))
             raise
 
-    def snapshot_group_crop(self, group_layer: Any, crop_bbox: dict[str, int]) -> bytes | None:
+    def snapshot_group_crop(self, group_layer: Any, crop_bbox: dict[str, int], created_layer: Any | None = None) -> bytes | None:
         """Take a fresh snapshot of the group layer projection, cropped to bbox.
 
         Unlike the detection-time cache (which snapshots a single source layer),
@@ -216,10 +220,29 @@ class BBoxGenerationService:
         if not image.loadFromData(image_bytes, "PNG"):
             return None
 
-        # Convert document-space crop_bbox to projection-local coordinates
+        # Resolve crop region from created_layer bounds or crop_bbox fallback.
+        # created_layer was placed at force-crop position during detection,
+        # so its Krita node bounds() reflects the correct crop area.
+        if created_layer is not None:
+            try:
+                layer_node = getattr(created_layer, "node", created_layer)
+                layer_rect = layer_node.bounds()
+                bbox = {
+                    "x": int(layer_rect.x()),
+                    "y": int(layer_rect.y()),
+                    "width": int(layer_rect.width()),
+                    "height": int(layer_rect.height()),
+                }
+            except Exception as exc:
+                print(f"[BBoxGenerationService] WARNING: created_layer bounds() "
+                      f"failed, falling back to crop_bbox: {exc}")
+                bbox = self._normalized_bbox(crop_bbox)
+        else:
+            bbox = self._normalized_bbox(crop_bbox)
+
+        # Convert document-space bbox to projection-local coordinates
         offset_x = int(getattr(projection_bounds, "x", 0) or 0)
         offset_y = int(getattr(projection_bounds, "y", 0) or 0)
-        bbox = self._normalized_bbox(crop_bbox)
         x = bbox["x"] - offset_x
         y = bbox["y"] - offset_y
         width = bbox["width"]
@@ -235,9 +258,30 @@ class BBoxGenerationService:
         width = min(width, int(image.width()) - x)
         height = min(height, int(image.height()) - y)
         if width <= 0 or height <= 0:
+            if self._DEBUG and self.log_callback is not None:
+                self.log_callback(
+                    f"[snapshot] FAILED: empty after clamp ({width}x{height})"
+                )
             return None
 
+        if self._DEBUG and self.log_callback is not None:
+            _cl = locals().get("created_layer")
+            _cl_name = "None" if _cl is None else str(getattr(_cl, "name", "?"))
+            _crop_arg = self._normalized_bbox(crop_bbox)
+            self.log_callback(
+                f"[snapshot] created_layer={_cl_name} | "
+                f"resolved_bbox={bbox} | "
+                f"crop_bbox_arg={_crop_arg} | "
+                f"proj=({offset_x},{offset_y}) | "
+                f"img_size={image.width()}x{image.height()} | "
+                f"final=({x},{y},{width}x{height})"
+            )
+
         crop = image.copy(x, y, width, height)
+        if self._DEBUG and self.log_callback is not None:
+            self.log_callback(
+                f"[snapshot] QImage after copy: {crop.width()}x{crop.height()}"
+            )
         data = QtCore.QByteArray()
         buffer = QtCore.QBuffer(data)
         open_mode = getattr(QtCore.QIODevice, "OpenModeFlag", None)
@@ -255,7 +299,9 @@ class BBoxGenerationService:
 
         # Fresh snapshot: re-crop from group composite so the image
         # includes any previously applied generation result layers.
-        fresh_crop = self.snapshot_group_crop(task.group_layer, task.bbox)
+        # Pass created_layer for accurate force-crop bounds.
+        _created_layer = getattr(row, "created_layer", None) if row is not None else None
+        fresh_crop = self.snapshot_group_crop(task.group_layer, task.bbox, created_layer=_created_layer)
         if fresh_crop:
             task.crop_png_bytes = fresh_crop
 
@@ -292,7 +338,9 @@ class BBoxGenerationService:
             job_id = ""
             try:
                 # 1. Fresh snapshot (captures any previously applied layers)
-                fresh_crop = self.snapshot_group_crop(task.group_layer, task.bbox)
+                # Pass created_layer for accurate force-crop bounds.
+                _created_layer = getattr(row, "created_layer", None) if row is not None else None
+                fresh_crop = self.snapshot_group_crop(task.group_layer, task.bbox, created_layer=_created_layer)
                 if fresh_crop:
                     task.crop_png_bytes = fresh_crop
 
@@ -396,6 +444,11 @@ class BBoxGenerationService:
         bbox = self._normalized_bbox(task.bbox)
         crop_image = Image.from_bytes(task.crop_png_bytes, "PNG")
         expected_extent = Extent(bbox["width"], bbox["height"])
+        if self._DEBUG and self.log_callback is not None:
+            self.log_callback(
+                f"[build_workflow] crop_png={crop_image.width}x{crop_image.height} | "
+                f"task.bbox={bbox} | bytes_len={len(task.crop_png_bytes)}"
+            )
         if crop_image.extent != expected_extent:
             raise RuntimeError(
                 "BBox crop PNG extent does not match crop_bbox: "
@@ -660,6 +713,11 @@ class BBoxGenerationService:
         extent = getattr(output_image, "extent", None)
         width = int(getattr(extent, "width", 0) or (extent[0] if extent else 0))
         height = int(getattr(extent, "height", 0) or (extent[1] if extent else 0))
+        if self._DEBUG and self.log_callback is not None:
+            self.log_callback(
+                f"[apply_result] output={width}x{height} | "
+                f"expected={expected_extent.width}x{expected_extent.height}"
+            )
         if width <= 0 or height <= 0:
             raise RuntimeError("Generated image extent is invalid.")
         if width != expected_extent.width or height != expected_extent.height:
@@ -775,6 +833,14 @@ class BBoxGenerationService:
             x=bbox["x"],
             y=bbox["y"],
         )
+        if self._DEBUG and self.log_callback is not None:
+            _node = getattr(created_layer, "node", created_layer)
+            _b = _node.bounds()
+            self.log_callback(
+                f"[apply] after setPixelData: "
+                f"bounds=({_b.x()},{_b.y()},{_b.width()}x{_b.height()}) | "
+                f"expected=({bbox['x']},{bbox['y']},{bbox['width']}x{bbox['height']})"
+            )
         self._move_layer_to_group_top(document_ref, created_layer, task.group_layer)
         # Refine: never attach mask. Detection: follow task flag.
         is_refine = str(getattr(task, "detector_mode", "") or "").strip().lower() == "refine"
@@ -785,6 +851,13 @@ class BBoxGenerationService:
                 bbox=bbox,
                 blur_px=24,
             )
+            if self._DEBUG and self.log_callback is not None:
+                _node2 = getattr(created_layer, "node", created_layer)
+                _b2 = _node2.bounds()
+                self.log_callback(
+                    f"[apply] after mask: "
+                    f"bounds=({_b2.x()},{_b2.y()},{_b2.width()}x{_b2.height()})"
+                )
         result = RepairGenerationResult(
             task=task,
             success=True,
