@@ -170,6 +170,12 @@ class PromptExtractionWorker:
 
     # ---- Group-level tagger cache (tag[threshold]) ----
 
+    @staticmethod
+    def _parse_threshold(cache_key: str) -> str:
+        """Extract threshold string from cache_key like 'tag[0.3]' -> '0.3'."""
+        m = __import__("re").match(r"^tag\[(.+)\]$", cache_key)
+        return m.group(1) if m else cache_key
+
     def _get_group_tagger_cache(
         self, row: RepairResultRow, cache_key: str,
     ) -> str | None:
@@ -178,6 +184,16 @@ class PromptExtractionWorker:
         if record is None:
             return None
         snapshot = getattr(record, "params_snapshot", None) or {}
+        # New path: metadata.tag_cache[threshold]
+        threshold_str = self._parse_threshold(cache_key)
+        metadata = snapshot.get("metadata")
+        if isinstance(metadata, dict):
+            tag_cache = metadata.get("tag_cache")
+            if isinstance(tag_cache, dict):
+                cached = tag_cache.get(threshold_str)
+                if cached and isinstance(cached, str):
+                    return cached
+        # Fallback: old top-level key for un-migrated KRA files
         cached = snapshot.get(cache_key)
         if cached and isinstance(cached, str):
             return cached
@@ -186,13 +202,25 @@ class PromptExtractionWorker:
     def _set_group_tagger_cache(
         self, row: RepairResultRow, cache_key: str, prompt_text: str,
     ) -> None:
-        """Save only the tagger prompt cache namespace to SyncMapStore."""
+        """Save tagger prompt cache into metadata.tag_cache namespace."""
         record = row.record
         if record is None:
             return
 
         snapshot = dict(getattr(record, "params_snapshot", None) or {})
-        snapshot[cache_key] = str(prompt_text or "")
+        # Ensure metadata dict exists
+        metadata = snapshot.get("metadata")
+        if not isinstance(metadata, dict):
+            metadata = {}
+            snapshot["metadata"] = metadata
+        # Ensure tag_cache sub-dict exists
+        tag_cache = metadata.get("tag_cache")
+        if not isinstance(tag_cache, dict):
+            tag_cache = {}
+            metadata["tag_cache"] = tag_cache
+        # Write to safe namespace
+        threshold_str = self._parse_threshold(cache_key)
+        tag_cache[threshold_str] = str(prompt_text or "")
         record.params_snapshot = snapshot
 
         try:
