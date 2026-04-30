@@ -16,6 +16,7 @@ from .prompt_extraction_service import PromptExtractionService
 from .prompt_extraction_worker import PromptExtractionProgress, PromptExtractionWorker
 from .repair_result_model import RepairResultSelectionModel, RepairResultRow
 from .repair_state_store import RepairStateRecord, RepairStateStore
+from .row_info_presenter import RepairRowInfoPresenter
 from .repair_compat import (
     QCheckBox,
     QComboBox,
@@ -72,6 +73,7 @@ class RepairDocker(DockWidget):
         self.detector_manager = DetectorModelManager()
         self.group_selection_model = GroupSelectionModel()
         self.result_selection_model = RepairResultSelectionModel()
+        self._row_info_presenter = RepairRowInfoPresenter()
         self.metadata_service = LayerMetadataService()
         self.repair_state_store: RepairStateStore | None = None
         self.prompt_worker: PromptExtractionWorker | None = None
@@ -391,10 +393,18 @@ class RepairDocker(DockWidget):
     def _build_group_row_widget(self, row: RepairGroupRow) -> QWidget:
         """Build one group row widget."""
         row_widget = QWidget()
+        row_widget.setFixedHeight(32)
         row_layout = QHBoxLayout()
+        row_layout.setContentsMargins(4, 2, 4, 2)
+        row_layout.setSpacing(6)
         row_widget.setLayout(row_layout)
 
-        selected = QCheckBox()
+        selected = QCheckBox("Include")
+        selected.setFixedWidth(86)
+        selected.setFixedHeight(24)
+        selected.setToolTip(
+            "Include this group in batch actions such as Detect, Refine, and Sync All."
+        )
         selected.setChecked(bool(row.selected))
         selected.setEnabled(row.is_resolved)
         selected.stateChanged.connect(
@@ -405,6 +415,11 @@ class RepairDocker(DockWidget):
         )
 
         active = QCheckBox("Active")
+        active.setFixedWidth(76)
+        active.setFixedHeight(24)
+        active.setToolTip(
+            "Keep this group enabled for batch actions. Turn off to keep it listed but inactive."
+        )
         active.setChecked(bool(row.active))
         active.stateChanged.connect(
             lambda _state, target=row, widget=active: self._set_group_active(
@@ -413,17 +428,15 @@ class RepairDocker(DockWidget):
             )
         )
 
-        resolved = "resolved" if row.is_resolved else "unresolved"
-        warnings = "; ".join(row.warnings)
-        refine_tag = row.refine_reason
-        label = QLabel(
-            f"#{row.sync_index} | {row.display_name} | {row.export_key} | "
-            f"layers={len(row.layer_ids)} | {resolved} | created={row.detected_count}"
-            + (f" | refine={refine_tag}" if refine_tag else "")
-            + (f" | {warnings}" if warnings else "")
-        )
+        info = self._row_info_presenter.for_group(row)
+        label = QLabel(info.summary)
+        label.setFixedWidth(240)
+        label.setFixedHeight(24)
+        label.setToolTip(info.tooltip)
 
         sync_button = QPushButton("Sync")
+        sync_button.setFixedWidth(96)
+        sync_button.setFixedHeight(24)
         sync_button.setEnabled(row.is_resolved)
         sync_button.clicked.connect(
             lambda _checked=False, target=row: self._sync_group_row(target)
@@ -433,6 +446,7 @@ class RepairDocker(DockWidget):
         row_layout.addWidget(active)
         row_layout.addWidget(label)
         row_layout.addWidget(sync_button)
+        row_layout.addStretch()
         return row_widget
 
     def _set_group_selected(self, row: RepairGroupRow, selected: bool) -> None:
@@ -472,10 +486,16 @@ class RepairDocker(DockWidget):
     def _build_result_row_widget(self, row: RepairResultRow) -> QWidget:
         """Build one detection result row widget."""
         row_widget = QWidget()
+        row_widget.setFixedHeight(32)
         row_layout = QHBoxLayout()
+        row_layout.setContentsMargins(4, 2, 4, 2)
+        row_layout.setSpacing(6)
         row_widget.setLayout(row_layout)
 
-        selected = QCheckBox()
+        selected = QCheckBox("Include")
+        selected.setFixedWidth(86)
+        selected.setFixedHeight(24)
+        selected.setToolTip("Include this result in selected-result actions.")
         selected.setChecked(bool(row.selected))
         selected.stateChanged.connect(
             lambda _state, target=row, widget=selected: self._set_result_selected(
@@ -485,6 +505,9 @@ class RepairDocker(DockWidget):
         )
 
         visible = QCheckBox("Visible")
+        visible.setFixedWidth(78)
+        visible.setFixedHeight(24)
+        visible.setToolTip("Show or hide the row target layer in Krita.")
         visible.setChecked(bool(getattr(row, "visible", True)))
         visible.stateChanged.connect(
             lambda _state, target=row, widget=visible: self._set_result_visible(
@@ -494,6 +517,9 @@ class RepairDocker(DockWidget):
         )
 
         active = QCheckBox("Active")
+        active.setFixedWidth(76)
+        active.setFixedHeight(24)
+        active.setToolTip("Keep this result enabled for batch actions.")
         active.setChecked(bool(row.active))
         active.stateChanged.connect(
             lambda _state, target=row, widget=active: self._set_result_active(
@@ -502,16 +528,27 @@ class RepairDocker(DockWidget):
             )
         )
 
-        label = QLabel(self._result_row_label(row))
-        tag_label = QLabel(f"Tag: {row.effective_prompt_type() or 'Unclassified'}")
+        info = self._row_info_presenter.for_result(row)
+        label = QLabel(info.summary)
+        label.setFixedWidth(220)
+        label.setFixedHeight(24)
+        label.setToolTip(info.tooltip)
+        tag_label = QLabel(f"Type: {row.effective_prompt_type() or 'Unclassified'}")
+        tag_label.setFixedWidth(120)
+        tag_label.setFixedHeight(24)
+        tag_label.setToolTip(info.tooltip)
 
         merge_button = QPushButton("Merge")
+        merge_button.setFixedWidth(72)
+        merge_button.setFixedHeight(24)
         merge_button.setEnabled(bool(row.generation_result_layer_id))
         merge_button.clicked.connect(
             lambda _checked=False, target=row: self._merge_result_generation_layer(target)
         )
 
         delete_button = QPushButton("X")
+        delete_button.setFixedWidth(32)
+        delete_button.setFixedHeight(24)
         delete_button.clicked.connect(
             lambda _checked=False, target=row: self._delete_result_row(target)
         )
@@ -523,6 +560,7 @@ class RepairDocker(DockWidget):
         row_layout.addWidget(tag_label)
         row_layout.addWidget(merge_button)
         row_layout.addWidget(delete_button)
+        row_layout.addStretch()
         return row_widget
 
     def _set_result_selected(self, row: RepairResultRow, selected: bool) -> None:
@@ -793,12 +831,7 @@ class RepairDocker(DockWidget):
 
     def _result_row_label(self, row: RepairResultRow) -> str:
         """Return compact row text so action widgets have horizontal room."""
-        prompt = row.effective_prompt_type() or "unclassified"
-        merge = getattr(row, "merge_status", "not_started")
-        return (
-            f"{row.display_name} | type={prompt} | tag={row.prompt_status} | "
-            f"gen={row.generation_status} | merge={merge}"
-        )
+        return self._row_info_presenter.for_result(row).summary
 
     def _set_combo_text(self, combo: QComboBox, text: str) -> None:
         """Best-effort select a QComboBox item by display text."""
