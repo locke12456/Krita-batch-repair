@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -28,6 +29,7 @@ class RepairGenerationTask:
     detector_mode: str
     detector_label: str
     prompt_type_prompt: str = ""
+    generated_layer_name: str = ""
     base_positive: str = ""
     user_positive: str = ""
     base_negative: str = ""
@@ -552,7 +554,8 @@ class BBoxGenerationService:
             layer_count=1,
         )
 
-        job_name = self._generated_layer_name(task)
+        job_name = self._generated_layer_name(task, seed=seed)
+        task.generated_layer_name = job_name
         job_params = JobParams(
             doc_bounds,
             job_name,
@@ -819,7 +822,7 @@ class BBoxGenerationService:
             )
 
         bbox = self._normalized_bbox(task.bbox)
-        name = layer_name or self._generated_layer_name(task)
+        name = layer_name or str(getattr(task, "generated_layer_name", "") or "") or self._generated_layer_name(task)
         document_ref = getattr(task.source_layer, "document_ref", None)
         if document_ref is None:
             raise RuntimeError("Source layer document_ref is required for bbox generation apply.")
@@ -978,16 +981,40 @@ class BBoxGenerationService:
             height = max(0, int(bbox.get("y2", 0) or 0) - y)
         return {"x": x, "y": y, "width": width, "height": height}
 
-    def _generated_layer_name(self, task: RepairGenerationTask) -> str:
-        mode = str(task.detector_mode or "repair").lower()
-        source_name = str(getattr(task.source_layer, "name", "") or "source")
-        if "head" in mode:
-            prefix = "[Generated repair head]"
-        elif "censor" in mode:
-            prefix = "[Generated repair censor]"
-        else:
-            prefix = f"[Generated repair {mode}]"
-        return f"{prefix} {source_name}"
+    def _generated_layer_name(self, task: RepairGenerationTask, seed: int | None = None) -> str:
+        mode = str(task.detector_mode or "repair").strip().lower() or "repair"
+        source_name = str(getattr(task.source_layer, "name", "") or "").strip()
+        short_name, existing_seed = self._generated_name_parts(source_name, mode)
+        seed_number = self._safe_seed_text(seed) or existing_seed
+        if seed_number:
+            return f"[Generated] {short_name} ({seed_number})"
+        return f"[Generated] {short_name}"
+
+    def _generated_name_parts(self, source_name: str, mode: str) -> tuple[str, str]:
+        raw = str(source_name or "").strip()
+        seed_match = re.search(r"\((\d+)\)\s*$", raw)
+        seed_number = seed_match.group(1) if seed_match else ""
+        if seed_match:
+            raw = raw[:seed_match.start()].strip()
+
+        raw = re.sub(r"^\[Generated[^\]]*\]\s*", "", raw).strip()
+        raw = re.sub(r"\s+", " ", raw).strip(" -_")
+        if not raw:
+            raw = mode or "repair"
+
+        max_chars = 36
+        if len(raw) > max_chars:
+            raw = raw[:max_chars].rstrip(" -_") + "..."
+        return raw, seed_number
+
+    def _safe_seed_text(self, seed: int | None) -> str:
+        if seed is None:
+            return ""
+        try:
+            value = int(seed)
+        except (TypeError, ValueError):
+            return ""
+        return str(value) if value > 0 else ""
 
     def _attach_generation_metadata(
         self,

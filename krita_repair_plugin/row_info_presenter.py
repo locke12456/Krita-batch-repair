@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 from typing import Any
 
 from .group_selection_model import RepairGroupRow
@@ -91,6 +92,9 @@ class RepairRowInfoPresenter:
             prompt_type,
             self._pipeline_state(row),
         ]
+        display_name = self._result_display_name(row)
+        if display_name.startswith("[Generated]"):
+            parts.append(display_name)
         badge = self._error_badge(row)
         if badge and badge not in parts[-1]:
             parts.append(badge)
@@ -98,7 +102,7 @@ class RepairRowInfoPresenter:
 
     def _result_tooltip(self, row: RepairResultRow) -> str:
         lines = [
-            self._line("Display name", row.display_name),
+            self._line("Display name", self._result_display_name(row)),
             self._line("Result id", row.result_id),
             self._line("Group id", row.group_id),
             self._line("Group name", row.group_name),
@@ -164,6 +168,38 @@ class RepairRowInfoPresenter:
         if row.prompt_status == PROMPT_FAILED or row.prompt_error:
             return "⚠"
         return ""
+
+    def _result_display_name(self, row: RepairResultRow) -> str:
+        candidates = [
+            getattr(row, "generation_result_layer_name", ""),
+            getattr(row, "created_layer_name", ""),
+            getattr(row, "display_name", ""),
+        ]
+        for candidate in candidates:
+            text = self._safe_text(candidate, "")
+            if text.startswith("[Generated"):
+                short_name, seed_number = self._generated_name_parts(text)
+                if seed_number:
+                    return f"[Generated] {short_name} ({seed_number})"
+                return f"[Generated] {short_name}"
+        return self._safe_text(getattr(row, "display_name", ""), "unknown")
+
+    def _generated_name_parts(self, value: str) -> tuple[str, str]:
+        raw = str(value or "").strip()
+        seed_match = re.search(r"\((\d+)\)\s*$", raw)
+        seed_number = seed_match.group(1) if seed_match else ""
+        if seed_match:
+            raw = raw[:seed_match.start()].strip()
+
+        raw = re.sub(r"^\[Generated[^\]]*\]\s*", "", raw).strip()
+        raw = re.sub(r"\s+", " ", raw).strip(" -_")
+        if not raw:
+            raw = "generated"
+
+        max_chars = 36
+        if len(raw) > max_chars:
+            raw = raw[:max_chars].rstrip(" -_") + "..."
+        return raw, seed_number
 
     def _format_bbox(self, value: dict[str, int]) -> str:
         if not value:
