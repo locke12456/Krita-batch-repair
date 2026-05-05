@@ -247,7 +247,7 @@ class GroupRefineService:
                     error="Source layer projection bounds are empty.",
                 )
 
-            prompt_text = row.refine_prompt
+            prompt_text = row.refine_source_text
 
             task = RepairGenerationTask(
                 record=row.record,

@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Iterable
+from decimal import Decimal, InvalidOperation
+from typing import Any, Iterable, Literal
 
 from krita_ai_metadata.sync_map_store import SyncRecord
 
@@ -33,6 +34,71 @@ def _extract_refine_prompt(params_snapshot: dict) -> str:
     return ""
 
 
+RefineSourceMode = Literal["prompt", "tag"]
+
+
+def _normalize_threshold_key(threshold: float | str | None) -> str:
+    """Normalize equivalent threshold inputs to one cache key."""
+    if threshold is None:
+        return ""
+    raw = str(threshold).strip()
+    if not raw:
+        return ""
+    try:
+        value = Decimal(raw)
+    except (InvalidOperation, ValueError):
+        return raw
+    text = format(value.normalize(), "f")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    if text in {"", "-0"}:
+        text = "0"
+    if text.startswith("."):
+        text = "0" + text
+    if text.startswith("-."):
+        text = "-0" + text[1:]
+    return text
+
+
+def _extract_refine_tag(
+    params_snapshot: dict,
+    threshold: float | str | None,
+) -> tuple[str, str]:
+    """Read tag text from params_snapshot metadata tag cache."""
+    if not params_snapshot:
+        return "", ""
+
+    metadata = params_snapshot.get("metadata")
+    if not isinstance(metadata, dict):
+        return "", ""
+
+    tag_cache = metadata.get("tag_cache")
+    if not isinstance(tag_cache, dict) or not tag_cache:
+        return "", ""
+
+    if threshold is None:
+        for raw_key in reversed(list(tag_cache.keys())):
+            value = tag_cache.get(raw_key)
+            text = str(value or "").strip()
+            if text:
+                return text, _normalize_threshold_key(raw_key)
+        return "", ""
+
+    threshold_key = _normalize_threshold_key(threshold)
+    value = tag_cache.get(threshold_key)
+    text = str(value or "").strip()
+    if text:
+        return text, threshold_key
+
+    for raw_key, value in tag_cache.items():
+        if _normalize_threshold_key(raw_key) == threshold_key:
+            text = str(value or "").strip()
+            if text:
+                return text, _normalize_threshold_key(raw_key)
+
+    return "", threshold_key
+
+
 @dataclass(slots=True)
 class RepairGroupRow:
     record: SyncRecord
@@ -43,6 +109,8 @@ class RepairGroupRow:
     warnings: list[str] = field(default_factory=list)
     created_layer_ids: list[str] = field(default_factory=list)
     detected_count: int = 0
+    refine_source_mode: RefineSourceMode = "prompt"
+    refine_threshold: float | None = None
 
     @property
     def export_key(self) -> str:
@@ -77,11 +145,30 @@ class RepairGroupRow:
         return _extract_refine_prompt(self.record.params_snapshot)
 
     @property
+    def refine_tag(self) -> str:
+        tag_text, threshold_key = _extract_refine_tag(
+            self.record.params_snapshot,
+            self.refine_threshold,
+        )
+        if threshold_key:
+            try:
+                self.refine_threshold = float(threshold_key)
+            except ValueError:
+                pass
+        return tag_text
+
+    @property
+    def refine_source_text(self) -> str:
+        if self.refine_source_mode == "tag":
+            return self.refine_tag
+        return self.refine_prompt
+
+    @property
     def refine_eligible(self) -> bool:
         return (
             self.record.target_type == "group"
             and self.is_resolved
-            and bool(self.refine_prompt)
+            and bool(self.refine_source_text)
         )
 
     @property
@@ -90,7 +177,9 @@ class RepairGroupRow:
             return "not a group record"
         if not self.is_resolved:
             return "group unresolved"
-        if not self.refine_prompt:
+        if not self.refine_source_text:
+            if self.refine_source_mode == "tag":
+                return "no tag cache"
             return "no prompt in params_snapshot"
         return "refine-ready"
 

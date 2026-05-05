@@ -54,11 +54,17 @@ class RepairRowInfoPresenter:
 
     def _group_summary(self, row: RepairGroupRow) -> str:
         resolved = "resolved" if row.is_resolved else "unresolved"
+        prompt_badge = "prompt:✓" if row.refine_prompt else "prompt:✗"
+        tag_badge = "tag:✓" if row.refine_tag else "tag:✗"
+        source_badge = f"src:{row.refine_source_mode}"
         parts = [
             f"#{row.sync_index}",
             resolved,
             f"layers={len(row.layer_ids)}",
             f"created={row.detected_count}",
+            prompt_badge,
+            tag_badge,
+            source_badge,
         ]
         badge = self._warning_badge(row)
         if badge:
@@ -78,6 +84,10 @@ class RepairRowInfoPresenter:
             self._line("Source layer count", len(row.source_layers)),
             self._line("Created count", row.detected_count),
             self._line("Created layer ids", ", ".join(row.created_layer_ids) if row.created_layer_ids else "none"),
+            self._line("Refine source", row.refine_source_mode),
+            self._line("Refine prompt present", "yes" if row.refine_prompt else "no"),
+            self._line("Refine tag present", "yes" if row.refine_tag else "no"),
+            self._line("Refine tag threshold", row.refine_threshold if row.refine_threshold is not None else "latest"),
             self._line("Refine reason", row.refine_reason),
         ]
         if row.warnings:

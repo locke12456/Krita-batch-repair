@@ -10,6 +10,7 @@ from .detector_model_manager import DetectorModelManager
 from .group_batch_detection_service import GroupBatchDetectionService, GroupDetectionReport
 from .group_refine_service import GroupRefineService
 from .group_selection_model import GroupSelectionModel, RepairGroupRow
+from .group_tag_extraction_service import GroupTagExtractionService
 from .group_sync_source import GroupSyncSource
 from .layer_metadata_service import LayerMetadataService
 from .prompt_extraction_service import PromptExtractionService
@@ -80,6 +81,7 @@ class RepairDocker(DockWidget):
         self.prompt_extraction_service = PromptExtractionService(
             metadata_service=self.metadata_service,
         )
+        self.group_tag_extraction_service: GroupTagExtractionService | None = None
         self.bbox_generation_service = BBoxGenerationService(
             metadata_service=self.metadata_service,
             on_row_finished=self._on_generation_row_finished,
@@ -108,6 +110,8 @@ class RepairDocker(DockWidget):
         self._unload_button = QPushButton("Unload Detector")
         self._detect_button = QPushButton("Batch Detect Selected Groups")
         self._refine_groups_button = QPushButton("Refine Selected Groups")
+        self._refine_source_combo = QComboBox()
+        self._extract_group_tags_button = QPushButton("Extract Tags for Selected Groups")
         self._sync_all_button = QPushButton("Sync All")
         self._image2tagger_checkbox = QCheckBox("Use image2tagger prompt")
         self._image2tagger_threshold_input = QLineEdit("0.8")
@@ -160,6 +164,8 @@ class RepairDocker(DockWidget):
             self._mode_combo.addItem(mode)
         for prompt_type, _fragment in PROMPT_TYPE_OPTIONS:
             self._result_filter_prompt_combo.addItem(prompt_type)
+        for refine_source in ("Prompt", "Tag"):
+            self._refine_source_combo.addItem(refine_source)
 
         root = QWidget()
         layout = QVBoxLayout()
@@ -208,6 +214,9 @@ class RepairDocker(DockWidget):
 
         refine_sync_row = QHBoxLayout()
         refine_sync_row.addWidget(self._refine_groups_button)
+        refine_sync_row.addWidget(QLabel("Refine source"))
+        refine_sync_row.addWidget(self._refine_source_combo)
+        refine_sync_row.addWidget(self._extract_group_tags_button)
         refine_sync_row.addWidget(self._sync_all_button)
         layout.addLayout(refine_sync_row)
         layout.addWidget(self._detect_button)
@@ -265,6 +274,12 @@ class RepairDocker(DockWidget):
         )
         self._detect_button.clicked.connect(self._batch_detect_selected_groups)
         self._refine_groups_button.clicked.connect(self._refine_selected_groups)
+        self._refine_source_combo.currentIndexChanged.connect(
+            self._on_global_refine_source_changed
+        )
+        self._extract_group_tags_button.clicked.connect(
+            self._extract_tags_for_selected_groups
+        )
         self._sync_all_button.clicked.connect(self._sync_all_refined_groups)
         self._select_all_button.clicked.connect(self._select_all_groups)
         self._clear_selected_button.clicked.connect(self._clear_groups)
@@ -456,6 +471,76 @@ class RepairDocker(DockWidget):
     def _set_group_active(self, row: RepairGroupRow, active: bool) -> None:
         """Update a group row active flag from the UI."""
         row.active = bool(active)
+
+    def _current_refine_source_mode(self) -> str:
+        """Return the active group refine source mode."""
+        text = str(self._refine_source_combo.currentText() or "").strip().lower()
+        return "tag" if text == "tag" else "prompt"
+
+    def _on_global_refine_source_changed(self, _index: int) -> None:
+        """Apply the global refine source mode to selected resolved groups."""
+        mode = self._current_refine_source_mode()
+        for row in self.group_selection_model.selected_active_groups():
+            self._set_group_refine_source_mode(row, mode)
+        self._refresh_group_rows()
+
+    def _set_group_refine_source_mode(
+        self,
+        row: RepairGroupRow,
+        mode: str,
+    ) -> None:
+        """Set a group row refine source mode."""
+        row.refine_source_mode = "tag" if str(mode or "").lower() == "tag" else "prompt"
+
+    def _extract_tags_for_selected_groups(self) -> None:
+        """Run group-level image2tagger extraction for selected group rows."""
+        try:
+            rows = self.group_selection_model.selected_active_groups()
+            if not rows:
+                self._show_info("No selected resolved groups are available.")
+                return
+
+            threshold = self._parse_image2tagger_threshold()
+            if threshold is None:
+                return
+
+            document_ref = active_krita_document()
+            if document_ref is None:
+                self._show_error("No active Krita document.")
+                return
+
+            from krita_ai_metadata.sync_map_store import SyncMapStore
+            sync_map_store = SyncMapStore(document_ref)
+            self.group_tag_extraction_service = GroupTagExtractionService(
+                self.prompt_extraction_service,
+                sync_map_store,
+            )
+            reports = self.group_tag_extraction_service.extract_for_rows(rows, threshold)
+
+            success = sum(1 for report in reports if report.status == "success")
+            skipped = sum(1 for report in reports if report.status == "skipped")
+            failed = sum(1 for report in reports if report.status == "failed")
+            lines = [
+                f"Group Tag Report: success={success}, skipped={skipped}, "
+                f"failed={failed}, total={len(reports)}"
+            ]
+            for report in reports[:12]:
+                label = report.group_name or report.export_key
+                if report.status == "success":
+                    lines.append(f"[+] {label} | threshold={report.threshold}")
+                elif report.reason:
+                    lines.append(f"[-] {label} | {report.reason}")
+                else:
+                    lines.append(f"[x] {label} | {report.error}")
+
+            remaining = len(reports) - 12
+            if remaining > 0:
+                lines.append(f"... {remaining} more result(s)")
+
+            self._log_docker.set_report("\n".join(lines))
+            self._refresh_group_rows()
+        except Exception as exc:
+            self._show_error(str(exc))
 
     def _select_all_results(self) -> None:
         """Select all active detection result rows."""
@@ -1016,6 +1101,9 @@ class RepairDocker(DockWidget):
             if not rows:
                 self._show_info("No selected resolved groups are available.")
                 return
+            mode = self._current_refine_source_mode()
+            for row in rows:
+                self._set_group_refine_source_mode(row, mode)
             eligible = [row for row in rows if row.refine_eligible]
             if not eligible:
                 reasons = set(row.refine_reason for row in rows)
