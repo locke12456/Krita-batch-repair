@@ -193,34 +193,21 @@ class GroupRefineService:
                 self._notify_row_finished(row, report)
                 continue
 
-            if not row.source_layers:
-                report = GroupRefineReport(
-                    group_name=row.group_name or "",
-                    export_key=row.export_key,
-                    source_layer_name="",
-                    status="skipped",
-                    reason="no source layers",
-                )
-                reports.append(report.to_dict())
-                self._notify_row_finished(row, report)
-                continue
-
-            for source_layer in row.source_layers:
-                report = self._refine_one_source(row, source_layer)
-                reports.append(report.to_dict())
-                self._notify_row_finished(row, report)
+            report = self._refine_one_group(row)
+            reports.append(report.to_dict())
+            self._notify_row_finished(row, report)
 
         return reports
 
-    def _refine_one_source(
+    def _refine_one_group(
         self,
         row: RepairGroupRow,
-        source_layer: Any,
     ) -> GroupRefineReport:
-        """Refine one source layer within a group row."""
-        source_name = str(getattr(source_layer, "name", "") or "source")
+        """Refine one group row using the full group composite as input."""
+        source_layer = row.source_layers[0] if row.source_layers else row.group_layer
+        source_name = str(getattr(row.group_layer, "name", "") or row.display_name or "group")
         try:
-            rendered = render_node_projection(source_layer)
+            rendered = render_node_projection(row.group_layer)
             projection_bounds = rendered.bounds
             projection_png = bytes(rendered.to_bytes())
             if not projection_png:
@@ -229,7 +216,7 @@ class GroupRefineService:
                     export_key=row.export_key,
                     source_layer_name=source_name,
                     status="failed",
-                    error="Source layer projection rendered empty bytes.",
+                    error="Group projection rendered empty bytes.",
                 )
 
             bbox = {
@@ -244,7 +231,7 @@ class GroupRefineService:
                     export_key=row.export_key,
                     source_layer_name=source_name,
                     status="failed",
-                    error="Source layer projection bounds are empty.",
+                    error="Group projection bounds are empty.",
                 )
 
             prompt_text = row.refine_source_text
