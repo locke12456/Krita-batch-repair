@@ -15,6 +15,7 @@ from .group_sync_source import GroupSyncSource
 from .layer_metadata_service import LayerMetadataService
 from .prompt_extraction_service import PromptExtractionService
 from .prompt_extraction_worker import PromptExtractionProgress, PromptExtractionWorker
+from .remove_background_service import RemoveBackgroundService
 from .repair_result_model import RepairResultSelectionModel, RepairResultRow
 from .repair_state_store import RepairStateRecord, RepairStateStore
 from .row_info_presenter import RepairRowInfoPresenter
@@ -98,6 +99,9 @@ class RepairDocker(DockWidget):
             metadata_service=self.metadata_service,
             repair_state_store=self.repair_state_store,
         )
+        self.remove_background_service = RemoveBackgroundService(
+            prompt_service=self.prompt_extraction_service,
+        )
 
         self._log_docker = RepairLogDocker()
 
@@ -109,10 +113,9 @@ class RepairDocker(DockWidget):
         self._load_button = QPushButton("Load Detector")
         self._unload_button = QPushButton("Unload Detector")
         self._detect_button = QPushButton("Batch Detect Selected Groups")
-        self._refine_groups_button = QPushButton("Refine Selected Groups")
+        self._group_action_combo = QComboBox()
+        self._execute_group_action_button = QPushButton("Execute Group Action")
         self._refine_source_combo = QComboBox()
-        self._extract_group_tags_button = QPushButton("Extract Tags for Selected Groups")
-        self._sync_all_button = QPushButton("Sync All")
         self._image2tagger_checkbox = QCheckBox("Use image2tagger prompt")
         self._image2tagger_threshold_input = QLineEdit("0.8")
         self._generation_checkbox = QCheckBox("Generate bbox repair")
@@ -166,6 +169,13 @@ class RepairDocker(DockWidget):
             self._result_filter_prompt_combo.addItem(prompt_type)
         for refine_source in ("Prompt", "Tag"):
             self._refine_source_combo.addItem(refine_source)
+        for label, key in (
+            ("Refine", "refine"),
+            ("Extract Tags", "extract_tags"),
+            ("Sync All", "sync_all"),
+            ("Remove Background", "remove_background"),
+        ):
+            self._group_action_combo.addItem(label, key)
 
         root = QWidget()
         layout = QVBoxLayout()
@@ -212,13 +222,15 @@ class RepairDocker(DockWidget):
         rect_row.addWidget(self._clamp_rect_checkbox)
         layout.addLayout(rect_row)
 
-        refine_sync_row = QHBoxLayout()
-        refine_sync_row.addWidget(self._refine_groups_button)
-        refine_sync_row.addWidget(QLabel("Refine source"))
-        refine_sync_row.addWidget(self._refine_source_combo)
-        refine_sync_row.addWidget(self._extract_group_tags_button)
-        refine_sync_row.addWidget(self._sync_all_button)
-        layout.addLayout(refine_sync_row)
+        group_action_row = QHBoxLayout()
+        group_action_row.addWidget(QLabel("Group action"))
+        group_action_row.addWidget(self._group_action_combo)
+        group_action_row.addWidget(self._execute_group_action_button)
+        self._refine_source_label = QLabel("Refine source")
+        group_action_row.addWidget(self._refine_source_label)
+        group_action_row.addWidget(self._refine_source_combo)
+        layout.addLayout(group_action_row)
+        self._refresh_group_action_option_visibility()
         layout.addWidget(self._detect_button)
         layout.addWidget(self._status_label)
 
@@ -273,14 +285,15 @@ class RepairDocker(DockWidget):
             lambda _index: self._refresh_detector_filter_visibility()
         )
         self._detect_button.clicked.connect(self._batch_detect_selected_groups)
-        self._refine_groups_button.clicked.connect(self._refine_selected_groups)
+        self._execute_group_action_button.clicked.connect(
+            self._execute_selected_group_action
+        )
+        self._group_action_combo.currentIndexChanged.connect(
+            lambda _index: self._refresh_group_action_option_visibility()
+        )
         self._refine_source_combo.currentIndexChanged.connect(
             self._on_global_refine_source_changed
         )
-        self._extract_group_tags_button.clicked.connect(
-            self._extract_tags_for_selected_groups
-        )
-        self._sync_all_button.clicked.connect(self._sync_all_refined_groups)
         self._select_all_button.clicked.connect(self._select_all_groups)
         self._clear_selected_button.clicked.connect(self._clear_groups)
         self._select_all_results_button.clicked.connect(self._select_all_results)
@@ -528,6 +541,80 @@ class RepairDocker(DockWidget):
                 label = report.group_name or report.export_key
                 if report.status == "success":
                     lines.append(f"[+] {label} | threshold={report.threshold}")
+                elif report.reason:
+                    lines.append(f"[-] {label} | {report.reason}")
+                else:
+                    lines.append(f"[x] {label} | {report.error}")
+
+            remaining = len(reports) - 12
+            if remaining > 0:
+                lines.append(f"... {remaining} more result(s)")
+
+            self._log_docker.set_report("\n".join(lines))
+            self._refresh_group_rows()
+        except Exception as exc:
+            self._show_error(str(exc))
+
+    def _execute_selected_group_action(self) -> None:
+        """Dispatch the currently selected group action."""
+        action = self._current_group_action_key()
+        if action == "refine":
+            self._refine_selected_groups()
+        elif action == "extract_tags":
+            self._extract_tags_for_selected_groups()
+        elif action == "sync_all":
+            self._sync_all_refined_groups()
+        elif action == "remove_background":
+            self._remove_background_for_selected_groups()
+        else:
+            self._show_error(f"Unknown group action: {action}")
+
+    def _current_group_action_key(self) -> str:
+        """Return the stable key for the selected group action."""
+        current_data = getattr(self._group_action_combo, "currentData", None)
+        if callable(current_data):
+            value = current_data()
+            if value:
+                return str(value)
+        text = str(self._group_action_combo.currentText() or "").strip().lower()
+        if "refine" in text:
+            return "refine"
+        if "extract" in text or "tag" in text:
+            return "extract_tags"
+        if "sync" in text:
+            return "sync_all"
+        if "background" in text:
+            return "remove_background"
+        return text
+
+    def _refresh_group_action_option_visibility(self) -> None:
+        """Show action-specific group options only when they are relevant."""
+        is_refine = self._current_group_action_key() == "refine"
+        label = getattr(self, "_refine_source_label", None)
+        if label is not None:
+            label.setVisible(is_refine)
+        self._refine_source_combo.setVisible(is_refine)
+
+    def _remove_background_for_selected_groups(self) -> None:
+        """Run remove background for selected group rows and report results."""
+        try:
+            rows = self.group_selection_model.selected_active_groups()
+            if not rows:
+                self._show_info("No selected resolved groups are available.")
+                return
+
+            reports = self.remove_background_service.remove_for_rows(rows)
+            success = sum(1 for report in reports if report.status == "success")
+            skipped = sum(1 for report in reports if report.status == "skipped")
+            failed = sum(1 for report in reports if report.status == "failed")
+            lines = [
+                f"Remove Background Report: success={success}, skipped={skipped}, "
+                f"failed={failed}, total={len(reports)}"
+            ]
+            for report in reports[:12]:
+                label = report.group_name or report.export_key
+                if report.status == "success":
+                    lines.append(f"[+] {label} | {report.mask_layer_id}")
                 elif report.reason:
                     lines.append(f"[-] {label} | {report.reason}")
                 else:
