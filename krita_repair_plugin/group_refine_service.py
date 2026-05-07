@@ -180,6 +180,12 @@ class GroupRefineService:
     def refine_rows(self, rows: list[RepairGroupRow]) -> list[dict[str, Any]]:
         """Refine eligible group rows and return per-row report dicts."""
         reports: list[dict[str, Any]] = []
+        base_positive = ""
+        try:
+            base_positive, _base_negative = self.bbox_generation_service.active_model_prompt_snapshot()
+        except Exception as exc:
+            print(f"[GroupRefineService] WARNING: failed to read active prompt snapshot: {exc}")
+
         for row in rows:
             if not row.refine_eligible:
                 report = GroupRefineReport(
@@ -193,15 +199,32 @@ class GroupRefineService:
                 self._notify_row_finished(row, report)
                 continue
 
-            report = self._refine_one_group(row)
+            report = self._refine_one_group(row, base_positive=base_positive)
             reports.append(report.to_dict())
             self._notify_row_finished(row, report)
 
         return reports
 
+    def _compose_refine_prompt(
+        self,
+        base_positive: str,
+        refine_fragment: str,
+    ) -> str:
+        """Compose active Krita AI prompt with the selected refine fragment.
+
+        Style prompt is not appended here. The active krita-ai-diffusion
+        workflow remains responsible for style prompt merging.
+        """
+        base = str(base_positive or "").strip()
+        fragment = str(refine_fragment or "").strip()
+        if base and fragment:
+            return f"{base}, {fragment}"
+        return base or fragment
+
     def _refine_one_group(
         self,
         row: RepairGroupRow,
+        base_positive: str = "",
     ) -> GroupRefineReport:
         """Refine one group row using the full group composite as input."""
         source_layer = row.source_layers[0] if row.source_layers else row.group_layer
@@ -234,7 +257,10 @@ class GroupRefineService:
                     error="Group projection bounds are empty.",
                 )
 
-            prompt_text = row.refine_source_text
+            prompt_text = self._compose_refine_prompt(
+                base_positive=base_positive,
+                refine_fragment=row.refine_source_text,
+            )
 
             task = RepairGenerationTask(
                 record=row.record,
