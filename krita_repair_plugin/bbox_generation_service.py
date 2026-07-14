@@ -333,7 +333,7 @@ class BBoxGenerationService:
         tasks_and_rows: list[tuple[RepairGenerationTask, Any]],
     ) -> None:
         """Process tasks one-by-one: snapshot -> build -> enqueue -> await -> apply -> next."""
-        from ai_diffusion.jobs import JobKind, JobState
+        from ai_diffusion.model.jobs import JobKind, JobState
 
         for idx, (task, row) in enumerate(tasks_and_rows):
             result: RepairGenerationResult | None = None
@@ -406,7 +406,7 @@ class BBoxGenerationService:
             raise RuntimeError("Active ai-diffusion model has no connection.")
 
         try:
-            from ai_diffusion.connection import ConnectionState
+            from ai_diffusion.model.connection import ConnectionState
         except Exception as exc:
             raise RuntimeError(f"ai-diffusion connection API unavailable: {exc}") from exc
 
@@ -425,7 +425,7 @@ class BBoxGenerationService:
         try:
             from copy import copy
             from ai_diffusion import workflow
-            from ai_diffusion.api import (
+            from ai_diffusion.backend.api import (
                 ConditioningInput,
                 ExtentInput,
                 ImageInput,
@@ -434,10 +434,10 @@ class BBoxGenerationService:
                 WorkflowInput,
                 WorkflowKind,
             )
-            from ai_diffusion.client import resolve_arch
+            from ai_diffusion.backend.client import resolve_arch
             from ai_diffusion.files import FileLibrary
             from ai_diffusion.image import Bounds, Extent, Image, multiple_of
-            from ai_diffusion.jobs import JobParams
+            from ai_diffusion.model.jobs import JobParams
             from ai_diffusion.settings import settings
             from ai_diffusion.util import unique
         except Exception as exc:
@@ -656,7 +656,7 @@ class BBoxGenerationService:
         job_params: Any,
         row: Any | None,
     ) -> None:
-        from ai_diffusion.jobs import JobKind, JobState
+        from ai_diffusion.model.jobs import JobKind, JobState
 
         result: RepairGenerationResult | None = None
         job = None

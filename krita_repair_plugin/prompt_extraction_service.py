@@ -291,8 +291,8 @@ class PromptExtractionService:
     def connected_comfy_url(self) -> str:
         """Read the active ComfyUI URL from krita-ai-diffusion connection state."""
         try:
-            from ai_diffusion.connection import ConnectionState
-            from ai_diffusion.root import root
+            from ai_diffusion.model.connection import ConnectionState
+            from ai_diffusion.model.root import root
         except Exception as exc:
             raise RuntimeError(f"Krita AI Diffusion connection API unavailable: {exc}") from exc
 
