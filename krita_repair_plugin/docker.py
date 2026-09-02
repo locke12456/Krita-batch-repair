@@ -19,6 +19,7 @@ from .remove_background_service import RemoveBackgroundService
 from .repair_result_model import RepairResultSelectionModel, RepairResultRow
 from .repair_state_store import RepairStateRecord, RepairStateStore
 from .row_info_presenter import RepairRowInfoPresenter
+from .repair_diagnostics import exception_detail
 from .repair_compat import (
     QCheckBox,
     QComboBox,
@@ -98,6 +99,7 @@ class RepairDocker(DockWidget):
             bbox_generation_service=self.bbox_generation_service,
             metadata_service=self.metadata_service,
             repair_state_store=self.repair_state_store,
+            log_callback=lambda msg: self._log_docker.append_log(msg),
         )
         self.remove_background_service = RemoveBackgroundService(
             prompt_service=self.prompt_extraction_service,
@@ -1078,10 +1080,25 @@ class RepairDocker(DockWidget):
         """Refresh rows after async bbox generation completes."""
         if getattr(row, "is_refine_proxy", False):
             self._refresh_group_rows()
-            status = "success" if getattr(result, "success", False) else "failed"
-            error = str(getattr(result, "error", "") or "")
+            succeeded = bool(getattr(result, "success", False))
+            label = str(
+                getattr(getattr(row, "group_row", None), "display_name", "") or "group"
+            )
+            job_id = str(getattr(result, "job_id", "") or "?")
+            if succeeded:
+                layer = str(
+                    getattr(result, "created_layer_name", "")
+                    or getattr(result, "created_layer_id", "")
+                    or "?"
+                )
+                self._log_docker.append_log(
+                    f"[+] Refine generation success | {label} | job={job_id} | layer={layer}"
+                )
+                return
+            error = str(getattr(result, "error", "") or "") or "<no error detail reported>"
             self._log_docker.append_log(
-                f"Refine generation {status}" + (f": {error}" if error else "")
+                f"[x] Refine generation failed | {label} | job={job_id}\n"
+                + "\n".join(f"    {line}" for line in error.splitlines())
             )
             return
         self._refresh_result_rows()
@@ -1193,24 +1210,61 @@ class RepairDocker(DockWidget):
                 self._set_group_refine_source_mode(row, mode)
             eligible = [row for row in rows if row.refine_eligible]
             if not eligible:
-                reasons = set(row.refine_reason for row in rows)
+                for row in rows:
+                    self._log_docker.append_log(
+                        f"[-] {row.display_name} | not eligible for refine | "
+                        f"mode={row.refine_source_mode} | reason={row.refine_reason}"
+                    )
+                reasons = sorted({row.refine_reason for row in rows})
+                self._log_docker.set_report(
+                    f"Refine Report: no eligible groups out of {len(rows)} selected. "
+                    f"Reasons: {', '.join(reasons)}"
+                )
                 self._show_info(
                     "No selected groups are eligible for refine. "
-                    f"Reasons: {', '.join(reasons)}"
+                    f"Reasons: {', '.join(reasons)}\n\n"
+                    "See the Repair Log docker for the per-group detail."
                 )
                 return
             self.group_refine_service.repair_state_store = self._current_repair_state_store()
+            if self.group_refine_service.repair_state_store is None:
+                self._log_docker.append_log(
+                    "[refine] WARNING: no repair state store for the active document; "
+                    "results will not be persisted and old layers will not be replaced."
+                )
             reports = self.group_refine_service.refine_rows(eligible)
             self._refresh_group_rows()
-            success = sum(1 for r in reports if r.get("status") == "success")
-            skipped = sum(1 for r in reports if r.get("status") == "skipped")
-            failed = sum(1 for r in reports if r.get("status") == "failed")
-            self._log_docker.set_report(
-                f"Refine Report: success={success}, skipped={skipped}, "
-                f"failed={failed}, total={len(reports)}"
-            )
+            self._refresh_refine_report(reports)
         except Exception as exc:
-            self._show_error(str(exc))
+            detail = exception_detail(exc)
+            self._log_docker.append_log(f"[refine] Refine aborted\n    {detail}")
+            self._show_error(detail)
+
+    def _refresh_refine_report(self, reports: list[dict[str, Any]]) -> None:
+        """Render a traceable refine report with the reason for every non-success."""
+        success = sum(1 for r in reports if r.get("status") == "success")
+        skipped = sum(1 for r in reports if r.get("status") == "skipped")
+        failed = sum(1 for r in reports if r.get("status") == "failed")
+        lines = [
+            f"Refine Report: queued={success}, skipped={skipped}, "
+            f"failed={failed}, total={len(reports)}"
+        ]
+        for report in reports:
+            status = str(report.get("status") or "")
+            if status == "success":
+                continue
+            name = str(report.get("group_name") or report.get("export_key") or "<unnamed>")
+            note = str(report.get("error") or report.get("reason") or "<no detail reported>")
+            first_line = note.splitlines()[0] if note.splitlines() else note
+            lines.append(f"[x] {name} | {status} | {first_line}")
+        if success:
+            lines.append(
+                "Queued rows finish asynchronously; their result is logged as "
+                "'generation done' or 'generation FAILED'."
+            )
+        self._log_docker.set_report(
+            "\n".join(lines) if len(lines) > 1 else lines[0]
+        )
 
     def _sync_group_row(self, row: RepairGroupRow) -> bool:
         """Sync one group row active source into RepairStateStore."""
@@ -1317,11 +1371,18 @@ class RepairDocker(DockWidget):
             print(message)
 
     def _show_error(self, message: str) -> None:
-        """Display an error message."""
+        """Display an error message and keep a copy in the log docker."""
+        text = str(message or "<no message>")
+        log_docker = getattr(self, "_log_docker", None)
+        if log_docker is not None:
+            try:
+                log_docker.append_log(f"[error] {text}")
+            except Exception:
+                pass
         try:
-            QMessageBox.critical(self, "Auto Detect Repair", message)
+            QMessageBox.critical(self, "Auto Detect Repair", text)
         except Exception:
-            print(message)
+            print(text)
 
     def closeEvent(self, event: Any) -> None:
         """Close log docker when main docker closes."""

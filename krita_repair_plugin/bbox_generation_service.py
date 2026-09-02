@@ -7,6 +7,7 @@ from typing import Any, Callable
 
 from krita_ai_metadata.sync_map_store import SyncRecord
 
+from .repair_diagnostics import emit_log, exception_detail
 from .repair_compat import (
     QtCore,
     QtGui,
@@ -69,6 +70,18 @@ class BBoxGenerationService:
         self.model_resolver = model_resolver or active_ai_model
         self.on_row_finished = on_row_finished
         self.log_callback = log_callback
+
+    def _log(self, text: str) -> None:
+        """Log unconditionally; failures must stay traceable outside debug mode."""
+        emit_log(self.log_callback, str(text))
+
+    def _task_label(self, task: RepairGenerationTask) -> str:
+        """Return a short identifier used to correlate log lines with a task."""
+        record = getattr(task, "record", None)
+        name = str(getattr(record, "group_name", "") or getattr(record, "export_key", "") or "")
+        if not name:
+            name = str(getattr(task.source_layer, "name", "") or "task")
+        return f"{name}/{task.detector_label or task.detector_mode or 'generate'}"
 
     def active_model_prompt_snapshot(self) -> tuple[str, str]:
         """Return current KAD UI positive and negative prompts without preparing a workflow."""
@@ -296,8 +309,18 @@ class BBoxGenerationService:
         return bytes(data)
 
     def enqueue_task(self, task: RepairGenerationTask, row: Any | None = None) -> RepairGenerationResult:
-        self.validate_task(task)
-        model = self.resolve_model()
+        label = self._task_label(task)
+        stage = "validate task"
+        try:
+            self.validate_task(task)
+            stage = "resolve active ai-diffusion model"
+            model = self.resolve_model()
+        except Exception as exc:
+            self._log(
+                f"[generate:{label}] FAILED while {stage}\n"
+                f"    {exception_detail(exc)}"
+            )
+            raise
 
         # Fresh snapshot: re-crop from group composite so the image
         # includes any previously applied generation result layers.
@@ -307,8 +330,20 @@ class BBoxGenerationService:
         if fresh_crop:
             task.crop_png_bytes = fresh_crop
 
-        workflow_input, job_params = self.build_workflow_input(task, model)
-        self._run_async(self._enqueue_and_watch(model, task, workflow_input, job_params, row))
+        try:
+            stage = "build workflow input"
+            workflow_input, job_params = self.build_workflow_input(task, model)
+            stage = "schedule async job"
+            self._run_async(
+                self._enqueue_and_watch(model, task, workflow_input, job_params, row)
+            )
+        except Exception as exc:
+            self._log(
+                f"[generate:{label}] FAILED while {stage}\n"
+                f"    {exception_detail(exc)}"
+            )
+            raise
+        self._log(f"[generate:{label}] queued; awaiting ComfyUI job result")
         return RepairGenerationResult(task=task, success=True)
 
 
@@ -383,14 +418,22 @@ class BBoxGenerationService:
                     row.generation_order = idx
 
             except Exception as exc:
+                detail = f"(job={job_id or '?'}): {exception_detail(exc)}"
+                self._log(f"[generate:{self._task_label(task)}] FAILED {detail}")
                 result = RepairGenerationResult(
                     task=task,
                     success=False,
                     job_id=job_id,
-                    error=str(exc),
+                    error=detail,
                 )
                 if row is not None:
-                    row.mark_generation_failed(str(exc), job_id)
+                    try:
+                        row.mark_generation_failed(detail, job_id)
+                    except Exception as mark_exc:
+                        self._log(
+                            "[generate] WARNING: mark_generation_failed raised\n"
+                            f"    {exception_detail(mark_exc)}"
+                        )
             finally:
                 if row is not None and result is not None:
                     self._notify_row_finished(row, result)
@@ -424,7 +467,7 @@ class BBoxGenerationService:
 
         try:
             from copy import copy
-            from ai_diffusion import workflow
+            from ai_diffusion.backend import workflow
             from ai_diffusion.backend.api import (
                 ConditioningInput,
                 ExtentInput,
@@ -499,7 +542,7 @@ class BBoxGenerationService:
             seed,
             checkpoint.version,
             prompt_inpaint_mode,
-            FileLibrary.instance(),
+            files=FileLibrary.instance(),
         )
 
         mask = None
@@ -661,41 +704,65 @@ class BBoxGenerationService:
         result: RepairGenerationResult | None = None
         job = None
         job_id = ""
+        label = self._task_label(task)
+        stage = "add job"
 
         try:
             # Use live_preview to avoid native preview/apply side effects in Model._finish_job().
             job = model.jobs.add(JobKind.live_preview, job_params)
+            stage = "enqueue job to ComfyUI"
             await model._enqueue_job(job, workflow_input, front=False)
             job_id = str(getattr(job, "id", "") or "")
             if row is not None:
                 row.mark_generation_running(job_id)
 
+            stage = "await job completion"
             while getattr(job, "state", None) not in {JobState.finished, JobState.cancelled}:
                 await asyncio.sleep(0.1)
 
             if getattr(job, "state", None) is not JobState.finished:
-                raise RuntimeError("BBox generation job was cancelled or interrupted.")
+                raise RuntimeError(
+                    "BBox generation job was cancelled or interrupted "
+                    f"(job={job_id or '?'}, state={getattr(job, 'state', None)!r})."
+                )
 
             if len(job.results) <= 0:
-                raise RuntimeError("BBox generation job finished without output image.")
+                raise RuntimeError(
+                    "BBox generation job finished without output image "
+                    f"(job={job_id or '?'}). Check the ComfyUI server log."
+                )
 
+            stage = "apply result to group"
             result = self.apply_image_result_to_group(task, job.results[0], job_id=job_id)
             if row is not None:
+                stage = "mark row done / replace source layer"
                 row.mark_generation_done(
                     result.created_layer_id,
                     result.created_layer_name,
                     job_id,
                 )
+            self._log(
+                f"[generate:{label}] done (job={job_id or '?'}, "
+                f"layer={result.created_layer_name or result.created_layer_id or '?'})"
+            )
 
         except Exception as exc:
+            detail = f"while {stage} (job={job_id or '?'}): {exception_detail(exc)}"
+            self._log(f"[generate:{label}] FAILED {detail}")
             result = RepairGenerationResult(
                 task=task,
                 success=False,
                 job_id=job_id,
-                error=str(exc),
+                error=detail,
             )
             if row is not None:
-                row.mark_generation_failed(str(exc), job_id)
+                try:
+                    row.mark_generation_failed(detail, job_id)
+                except Exception as mark_exc:
+                    self._log(
+                        f"[generate:{label}] WARNING: mark_generation_failed raised\n"
+                        f"    {exception_detail(mark_exc)}"
+                    )
         finally:
             if row is not None and result is not None:
                 self._notify_row_finished(row, result)
@@ -1049,10 +1116,31 @@ class BBoxGenerationService:
             from ai_diffusion import eventloop
 
             eventloop.run(future)
-        except Exception:
+            return
+        except Exception as exc:
+            self._log(
+                "[generate] WARNING: ai_diffusion eventloop.run() unavailable; "
+                "falling back to asyncio.create_task()\n"
+                f"    {exception_detail(exc)}"
+            )
+        try:
             asyncio.create_task(future)
+        except Exception as exc:
+            self._log(
+                "[generate] FAILED to schedule the generation coroutine; no job was "
+                "queued\n"
+                f"    {exception_detail(exc)}"
+            )
+            raise
 
     def _notify_row_finished(self, row: Any, result: RepairGenerationResult) -> None:
         callback = self.on_row_finished
-        if callable(callback):
+        if not callable(callback):
+            return
+        try:
             callback(row, result)
+        except Exception as exc:
+            self._log(
+                "[generate] WARNING: on_row_finished callback raised\n"
+                f"    {exception_detail(exc)}"
+            )
